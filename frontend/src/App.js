@@ -175,8 +175,18 @@ const TrendsSection = () => {
   };
 
   useEffect(() => {
+    const fetchTrends = async () => {
+      try {
+        const response = await fetch('/api/trends?days=30');
+        const data = await response.json();
+        setTrends(data);
+      } catch (error) {
+        console.error('Error fetching trends:', error);
+      }
+    };
+
     fetchTrends();
-  }, [days]);
+  }, []);
 
   return (
     <div className="trends-section">

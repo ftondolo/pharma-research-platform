@@ -1,301 +1,178 @@
-import openai
-import json
+# backend/ai_services.py
+
 import os
-from typing import List, Dict, Any, Optional
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from models import Article, Categories, Summary, TrendAnalysis
-import numpy as np
-from datetime import datetime, timedelta
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import json
+import hashlib
+import logging
+from typing import Optional, List, Dict
+from openai import OpenAI, OpenAIError
+import redis
+from tenacity import retry, stop_after_attempt, wait_exponential
+
+logger = logging.getLogger(__name__)
 
 class AIService:
-    """AI service for categorization, summarization, and embeddings"""
-    
     def __init__(self):
-        self.client = openai.OpenAI(
-            api_key="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"
-        )
-        self.embedding_model = "text-embedding-3-large"
-        self.chat_model = "gpt-4.1-mini"
-        self.executor = ThreadPoolExecutor(max_workers=5)
+        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
         
-        # Prompt templates
-        self.categorization_prompt = """
-Given this pharmaceutical research abstract, categorize it into:
-1. Primary therapeutic area (e.g., Oncology, Cardiology, Neurology, etc.)
-2. Research type (e.g., Clinical Trial, Drug Discovery, Review, etc.)
-3. Key topics (up to 5 specific topics)
-
-Return ONLY a JSON object with this structure:
-{
-  "primary_area": "string",
-  "research_type": "string", 
-  "key_topics": ["topic1", "topic2", "topic3"]
-}
-
-Abstract: {abstract}
-"""
+        # Use cheaper models by default
+        self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-ada-002")
+        self.chat_model = os.getenv("CHAT_MODEL", "gpt-3.5-turbo")
         
-        self.summary_prompt = """
-Create a structured summary of this pharmaceutical research abstract:
-
-Abstract: {abstract}
-
-Return ONLY a JSON object with this structure:
-{
-  "one_line": "Brief one-sentence summary",
-  "key_findings": ["finding1", "finding2", "finding3"],
-  "clinical_implications": "Brief clinical implications",
-  "limitations": "Any limitations mentioned or null"
-}
-"""
+        # Cache settings
+        self.embedding_cache_ttl = 86400 * 30  # 30 days
+        self.category_cache_ttl = 86400 * 7    # 7 days
         
-        self.trend_prompt = """
-Analyze these pharmaceutical research abstracts and identify:
-1. Most frequent topics (top 5)
-2. Emerging themes (new or growing topics)
-3. Notable shifts from what might be expected
-
-Return ONLY a JSON object with this structure:
-{
-  "frequent_topics": ["topic1", "topic2", "topic3"],
-  "emerging_themes": ["theme1", "theme2"],
-  "notable_shifts": ["shift1", "shift2"]
-}
-
-Abstracts: {abstracts}
-"""
+        # Feature flags
+        self.ai_enabled = os.getenv("AI_ENABLED", "true").lower() == "true"
+        self.use_cache = os.getenv("USE_AI_CACHE", "true").lower() == "true"
     
-    def _get_embedding_sync(self, text: str) -> List[float]:
-        """Synchronous embedding call"""
+    def get_cache_key(self, prefix: str, text: str) -> str:
+        """Generate cache key from text"""
+        text_hash = hashlib.md5(text.encode()).hexdigest()
+        return f"{prefix}:{text_hash}"
+    
+    async def generate_embedding_safe(self, text: str) -> Optional[List[float]]:
+        """Generate embedding with caching and error handling"""
+        if not self.ai_enabled:
+            logger.info("AI features disabled, skipping embedding generation")
+            return None
+        
+        if not text or not text.strip():
+            return None
+        
+        # Check cache first
+        if self.use_cache:
+            cache_key = self.get_cache_key("embedding", text)
+            try:
+                cached = self.redis_client.get(cache_key)
+                if cached:
+                    logger.info("Using cached embedding")
+                    return json.loads(cached)
+            except Exception as e:
+                logger.warning(f"Cache read error: {e}")
+        
+        # Generate new embedding
         try:
             response = self.client.embeddings.create(
-                input=text,
-                model=self.embedding_model
-            )
-            return response.data[0].embedding
-        except Exception as e:
-            print(f"Embedding error: {e}")
-            return []
-    
-    async def get_embedding(self, text: str) -> List[float]:
-        """Get embedding for text using OpenAI"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._get_embedding_sync, text)
-    
-    def _categorize_article_sync(self, abstract: str) -> List[str]:
-        """Synchronous categorization call"""
-        try:
-            response = self.client.chat.completions.create(
-                model=self.chat_model,
-                messages=[
-                    {"role": "system", "content": "You are a pharmaceutical research expert. Return only valid JSON."},
-                    {"role": "user", "content": self.categorization_prompt.format(abstract=abstract)}
-                ],
-                temperature=0.1,
-                max_tokens=200
+                model=self.embedding_model,
+                input=text[:8000]  # Limit input length
             )
             
-            result = json.loads(response.choices[0].message.content)
+            embedding = response.data[0].embedding
             
-            # Flatten categories into a list
-            categories = [result.get('primary_area', '')]
-            categories.append(result.get('research_type', ''))
-            categories.extend(result.get('key_topics', []))
+            # Cache the result
+            if self.use_cache:
+                try:
+                    cache_key = self.get_cache_key("embedding", text)
+                    self.redis_client.setex(
+                        cache_key,
+                        self.embedding_cache_ttl,
+                        json.dumps(embedding)
+                    )
+                except Exception as e:
+                    logger.warning(f"Cache write error: {e}")
             
-            return [cat for cat in categories if cat]
+            return embedding
             
-        except Exception as e:
-            print(f"Categorization error: {e}")
-            return []
-    
-    async def categorize_article(self, abstract: str) -> List[str]:
-        """Categorize an article abstract"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._categorize_article_sync, abstract)
-    
-    def _summarize_article_sync(self, abstract: str) -> Dict[str, Any]:
-        """Synchronous summarization call"""
-        try:
-            if not abstract or len(abstract.strip()) < 10:
-                print("Abstract too short or empty")
-                return {
-                    "one_line": "Abstract too short to summarize",
-                    "key_findings": [],
-                    "clinical_implications": "Not available",
-                    "limitations": None
-                }
-
-            print(f"Summarizing abstract: {abstract[:100]}...")
-
-            response = self.client.chat.completions.create(
-                model=self.chat_model,
-                messages=[
-                    {"role": "system", "content": "You are a pharmaceutical research expert. Return only valid JSON."},
-                    {"role": "user", "content": self.summary_prompt.format(abstract=abstract)}
-                ],
-                temperature=0.25,
-                max_tokens=400
-            )
-
-            # Safely extract content from response
-            response_text = ""
-
-            # Access response.choices[0].message["content"]
-            print("0")
-            if hasattr(response, "choices") and response.choices:
-                message = response.choices[0].message
-                print("1")
-                if isinstance(message, dict):
-                    response_text = message.get("content", "")
-                    if not response_text:
-                        print("A")
-                        raise ValueError("Empty 'content' in response message")
-                else:
-                    print("B")
-                    raise ValueError("Invalid message format")
+        except OpenAIError as e:
+            if "insufficient_quota" in str(e):
+                logger.error("OpenAI quota exceeded - please check billing")
             else:
-                print("C")
-                raise ValueError("No choices returned from OpenAI")
-
-            print(f"OpenAI response: {response_text}")
-
-            result = json.loads(response_text)
-            print(f"Parsed result: {result}")
-
-            # Validate and normalize expected fields
-            return {
-                "one_line": result.get("one_line", "No summary available"),
-                "key_findings": result.get("key_findings", []),
-                "clinical_implications": result.get("clinical_implications", "Not available"),
-                "limitations": result.get("limitations", None)
-            }
-
-        except json.JSONDecodeError as e:
-            print(f"JSON parsing error: {e}")
-            print(f"Raw response: {response_text}")
-            return {
-                "one_line": "Error parsing AI response",
-                "key_findings": [],
-                "clinical_implications": "Not available",
-                "limitations": None
-            }
+                logger.error(f"OpenAI API error: {e}")
+            return None
         except Exception as e:
-            print(f"Summary error: {e}")
-            print(f"Error type: {type(e).__name__}")
-            return {
-                "one_line": "Summary unavailable",
-                "key_findings": [],
-                "clinical_implications": "Not available",
-                "limitations": None
-            }
+            logger.error(f"Unexpected error generating embedding: {e}")
+            return None
     
-    async def summarize_article(self, abstract: str) -> Dict[str, Any]:
-        """Generate structured summary of an article"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._summarize_article_sync, abstract)
-    
-    async def find_similar_articles(
-        self, 
-        query_embedding: List[float], 
-        db: Session, 
-        limit: int = 5,
-        exclude_id: Optional[str] = None
-    ) -> List[Dict[str, Any]]:
-        """Find similar articles using cosine similarity"""
+    async def categorize_article_safe(self, article) -> Optional[Dict]:
+        """Categorize article with caching and error handling"""
+        if not self.ai_enabled:
+            logger.info("AI features disabled, skipping categorization")
+            return None
+        
+        # Check cache first
+        if self.use_cache:
+            cache_key = self.get_cache_key("category", article.title)
+            try:
+                cached = self.redis_client.get(cache_key)
+                if cached:
+                    logger.info("Using cached categories")
+                    return json.loads(cached)
+            except Exception as e:
+                logger.warning(f"Cache read error: {e}")
+        
         try:
-            if not query_embedding:
-                return []
-            
-            # Get all articles with embeddings
-            query = db.query(Article).filter(Article.embedding.isnot(None))
-            if exclude_id:
-                query = query.filter(Article.id != exclude_id)
-            
-            articles = query.all()
-            
-            if not articles:
-                return []
-            
-            # Calculate similarities
-            similarities = []
-            query_vec = np.array(query_embedding)
-            
-            for article in articles:
-                if article.embedding and len(article.embedding) > 0:
-                    try:
-                        article_vec = np.array(article.embedding)
-                        if len(article_vec) > 0 and len(query_vec) > 0:
-                            similarity = np.dot(query_vec, article_vec) / (
-                                np.linalg.norm(query_vec) * np.linalg.norm(article_vec)
-                            )
-                            similarities.append({
-                                'article': article,
-                                'similarity': float(similarity)
-                            })
-                    except Exception as e:
-                        print(f"Error calculating similarity for article {article.id}: {e}")
-                        continue
-            
-            # Sort by similarity and return top results
-            similarities.sort(key=lambda x: x['similarity'], reverse=True)
-            
-            results = []
-            for sim in similarities[:limit]:
-                article = sim['article']
-                results.append({
-                    'id': str(article.id),
-                    'title': article.title or 'Untitled',
-                    'similarity': sim['similarity'],
-                    'journal': article.journal or 'Unknown',
-                    'publication_date': article.publication_date.isoformat() if article.publication_date else None
-                })
-            
-            return results
-            
-        except Exception as e:
-            print(f"Similarity search error: {e}")
-            return []
-    
-    def _analyze_trends_sync(self, abstracts: List[str]) -> Dict[str, Any]:
-        """Synchronous trend analysis call"""
-        try:
-            # Limit abstracts to avoid token limits
-            sample_abstracts = abstracts[:20]
-            abstracts_text = "\n\n".join([f"Abstract {i+1}: {abs}" for i, abs in enumerate(sample_abstracts)])
+            # Simplified prompt to reduce tokens
+            prompt = f"""Categorize this research article:
+Title: {article.title}
+Abstract: {article.abstract[:1000]}
+
+Return JSON:
+{{"primary_area": "...", "secondary_areas": ["...", "..."], "keywords": ["...", "..."]}}"""
             
             response = self.client.chat.completions.create(
                 model=self.chat_model,
-                messages=[
-                    {"role": "system", "content": "You are a pharmaceutical research expert analyzing trends. Return only valid JSON."},
-                    {"role": "user", "content": self.trend_prompt.format(abstracts=abstracts_text)}
-                ],
-                temperature=0.2,
-                max_tokens=500
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0
             )
             
-            return json.loads(response.choices[0].message.content)
+            content = response.choices[0].message.content
+            categories = json.loads(content)
+            
+            # Cache the result
+            if self.use_cache:
+                try:
+                    cache_key = self.get_cache_key("category", article.title)
+                    self.redis_client.setex(
+                        cache_key,
+                        self.category_cache_ttl,
+                        json.dumps(categories)
+                    )
+                except Exception as e:
+                    logger.warning(f"Cache write error: {e}")
+            
+            return categories
+            
+        except OpenAIError as e:
+            if "insufficient_quota" in str(e):
+                logger.error("OpenAI quota exceeded - please check billing")
+            else:
+                logger.error(f"OpenAI API error: {e}")
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse AI response: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error categorizing article: {e}")
+            return None
+    
+    async def summarize_article_safe(self, article) -> Optional[str]:
+        """Generate article summary with error handling"""
+        if not self.ai_enabled:
+            # Return a basic summary without AI
+            return f"{article.title}. {article.abstract[:200]}..."
+        
+        try:
+            prompt = f"""Summarize this research article in 2-3 sentences:
+Title: {article.title}
+Abstract: {article.abstract[:1500]}"""
+            
+            response = self.client.chat.completions.create(
+                model=self.chat_model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=200,
+                temperature=0
+            )
+            
+            return response.choices[0].message.content
             
         except Exception as e:
-            print(f"Trend analysis error: {e}")
-            return {
-                "frequent_topics": [],
-                "emerging_themes": [],
-                "notable_shifts": []
-            }
-    
-    async def analyze_trends(self, abstracts: List[str]) -> Dict[str, Any]:
-        """Analyze trends in a collection of abstracts"""
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(self.executor, self._analyze_trends_sync, abstracts)
-    
-    def calculate_cosine_similarity(self, vec1: List[float], vec2: List[float]) -> float:
-        """Calculate cosine similarity between two vectors"""
-        try:
-            v1 = np.array(vec1)
-            v2 = np.array(vec2)
-            return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-        except:
-            return 0.0
+            logger.error(f"Failed to summarize article: {e}")
+            # Fallback to first sentences of abstract
+            return article.abstract[:200] + "..."
+
+# Singleton instance
+ai_service = AIService()

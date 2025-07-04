@@ -7,6 +7,12 @@ import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 import logging
+import rate_limiter
+import batch_processor
+from fastapi import FastAPI, Query, BackgroundTasks, HTTPException
+from typing import Optional, List
+import logging
+from datetime import datetime
 
 from database import get_db, init_db
 from models import Article, ArticleCreate, ArticleResponse, SearchQuery, SearchResponse
@@ -119,121 +125,142 @@ async def detailed_health_check(db: Session = Depends(get_db)):
     
     return health_status
 
-@app.post("/search", response_model=SearchResponse)
+logger = logging.getLogger(__name__)
+
+@app.post("/search")
 async def search_articles(
-    query: SearchQuery,
-    db: Session = Depends(get_db)
+    query: str = Query(..., description="Search query"),
+    limit: int = Query(10, ge=1, le=100),
+    use_ai: bool = Query(False, description="Enable AI features (embeddings/categorization)"),
+    background_tasks: BackgroundTasks = None
 ):
-    """Search for articles across multiple APIs with AI-powered ranking"""
+    """
+    Search for articles across multiple sources.
+    AI features are disabled by default to avoid quota issues.
+    """
     try:
-        logger.info(f"Search request: {query.query}")
+        logger.info(f"Search request: {query} (AI: {use_ai})")
         
-        # Search across all APIs
-        results = await api_manager.search_all(query.query, limit=query.limit)
+        # Search external APIs
+        articles = await api_manager.search_all(query, limit)
+        logger.info(f"Found {len(articles)} articles from APIs")
         
-        if not results:
-            logger.info("No results found for query")
-            return SearchResponse(articles=[], total=0)
-        
-        logger.info(f"Found {len(results)} articles from APIs")
-        
-        # Process results with AI for categorization and ranking
-        processed_articles = []
-        for result in results:
-            try:
-                # Generate embedding for semantic search
-                embedding = await ai_service.get_embedding(result.abstract)
-                
-                # Categorize article
-                categories = await ai_service.categorize_article(result.abstract)
-                
-                # Create article with processed data
-                article = ArticleResponse(
-                    id=result.id,
-                    doi=result.doi,
-                    title=result.title,
-                    authors=result.authors,
-                    publication_date=result.publication_date,
-                    journal=result.journal,
-                    abstract=result.abstract,
-                    url=result.url,
-                    categories=categories,
-                    embedding=embedding
-                )
-                processed_articles.append(article)
-                
-            except Exception as e:
-                logger.error(f"Error processing article {result.id}: {str(e)}")
-                # Continue with other articles if one fails
-                continue
-        
-        # Store in database with duplicate handling and collect database IDs
+        # Store articles WITHOUT AI processing
         stored_articles = []
-        for article in processed_articles:
-            try:
-                # Check if article already exists by DOI
-                existing_article = None
-                if article.doi:
-                    existing_article = db.query(Article).filter(Article.doi == article.doi).first()
-                
-                if existing_article:
-                    # Update existing article
-                    existing_article.title = article.title
-                    existing_article.authors = article.authors
-                    existing_article.publication_date = article.publication_date
-                    existing_article.journal = article.journal
-                    existing_article.abstract = article.abstract
-                    existing_article.url = article.url
-                    existing_article.categories = article.categories
-                    existing_article.embedding = article.embedding
-                    stored_articles.append(existing_article)
-                else:
-                    # Insert new article
-                    db_article = Article(
-                        doi=article.doi,
-                        title=article.title,
-                        authors=article.authors,
-                        publication_date=article.publication_date,
-                        journal=article.journal,
-                        abstract=article.abstract,
-                        url=article.url,
-                        categories=article.categories,
-                        embedding=article.embedding
-                    )
-                    db.add(db_article)
-                    db.flush()  # Get the ID without committing
-                    stored_articles.append(db_article)
-                    
-            except Exception as e:
-                logger.error(f"Error storing article {article.id}: {str(e)}")
+        for article_data in articles:
+            # Check if article already exists
+            existing = db.query(Article).filter(
+                Article.external_id == article_data['external_id'],
+                Article.source == article_data['source']
+            ).first()
+            
+            if existing:
+                stored_articles.append(existing)
                 continue
+            
+            # Create new article without AI fields
+            article = Article(
+                external_id=article_data['external_id'],
+                title=article_data['title'],
+                abstract=article_data.get('abstract', ''),
+                authors=article_data.get('authors', []),
+                published_date=article_data.get('published_date'),
+                source=article_data['source'],
+                url=article_data.get('url', ''),
+                metadata=article_data.get('metadata', {}),
+                # Skip AI fields
+                embedding=None,
+                categories=None,
+                summary=None
+            )
+            
+            db.add(article)
+            stored_articles.append(article)
         
         db.commit()
         logger.info(f"Stored {len(stored_articles)} articles in database")
         
-        # Return articles with database IDs
-        response_articles = []
-        for db_article in stored_articles:
-            response_article = ArticleResponse(
-                id=str(db_article.id),  # Use database UUID
-                doi=db_article.doi,
-                title=db_article.title,
-                authors=db_article.authors,
-                publication_date=db_article.publication_date,
-                journal=db_article.journal,
-                abstract=db_article.abstract,
-                url=db_article.url,
-                categories=db_article.categories,
-                embedding=db_article.embedding,
-                created_at=db_article.created_at
-            )
-            response_articles.append(response_article)
+        # Queue AI processing only if requested
+        if use_ai and background_tasks:
+            for article in stored_articles:
+                background_tasks.add_task(
+                    process_article_ai_safe, 
+                    article.id,
+                    skip_if_processed=True
+                )
+            logger.info(f"Queued {len(stored_articles)} articles for AI processing")
         
-        return SearchResponse(articles=response_articles, total=len(response_articles))
+        # Return articles immediately
+        return {
+            "articles": [
+                {
+                    "id": article.id,
+                    "title": article.title,
+                    "abstract": article.abstract[:500] + "..." if len(article.abstract) > 500 else article.abstract,
+                    "authors": article.authors,
+                    "published_date": article.published_date,
+                    "source": article.source,
+                    "url": article.url,
+                    "has_ai_features": bool(article.embedding or article.categories),
+                    "categories": article.categories,
+                    "relevance_score": article.metadata.get('relevance_score', 1.0)
+                }
+                for article in stored_articles
+            ],
+            "total": len(stored_articles),
+            "ai_processing": use_ai
+        }
         
     except Exception as e:
         logger.error(f"Search error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def process_article_ai_safe(article_id: int, skip_if_processed: bool = True):
+    """
+    Process article with AI features, with proper error handling
+    """
+    try:
+        article = db.query(Article).filter(Article.id == article_id).first()
+        if not article:
+            return
+        
+        # Skip if already processed
+        if skip_if_processed and (article.embedding or article.categories):
+            logger.info(f"Article {article_id} already processed, skipping")
+            return
+        
+        # Check rate limits before making requests
+        if not await rate_limiter.can_make_request('embeddings'):
+            logger.warning(f"Rate limit reached for embeddings, skipping article {article_id}")
+            return
+        
+        # Generate embedding with error handling
+        if not article.embedding:
+            try:
+                embedding = await ai_service.generate_embedding_safe(
+                    f"{article.title} {article.abstract[:1000]}"
+                )
+                if embedding:
+                    article.embedding = embedding
+                    db.commit()
+                    logger.info(f"Generated embedding for article {article_id}")
+            except Exception as e:
+                logger.error(f"Failed to generate embedding for article {article_id}: {e}")
+        
+        # Generate categories with error handling
+        if not article.categories and await rate_limiter.can_make_request('completions'):
+            try:
+                categories = await ai_service.categorize_article_safe(article)
+                if categories:
+                    article.categories = categories
+                    db.commit()
+                    logger.info(f"Generated categories for article {article_id}")
+            except Exception as e:
+                logger.error(f"Failed to categorize article {article_id}: {e}")
+                
+    except Exception as e:
+        logger.error(f"Error processing article {article_id}: {e}")
 
 @app.get("/articles/{article_id}")
 async def get_article(article_id: str, db: Session = Depends(get_db)):
@@ -324,6 +351,75 @@ async def get_trends(
     except Exception as e:
         logger.error(f"Error analyzing trends: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to analyze trends: {str(e)}")
+
+# Add these endpoints to backend/main.py
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "ai_enabled": ai_service.ai_enabled,
+        "cache_enabled": ai_service.use_cache
+    }
+
+@app.get("/usage")
+async def get_usage_stats():
+    """Get API usage statistics"""
+    stats = await rate_limiter.get_usage_stats()
+    
+    # Add database stats
+    db_stats = {
+        "total_articles": db.query(Article).count(),
+        "articles_with_embeddings": db.query(Article).filter(Article.embedding != None).count(),
+        "articles_with_categories": db.query(Article).filter(Article.categories != None).count(),
+        "articles_last_24h": db.query(Article).filter(
+            Article.created_at > datetime.now() - timedelta(days=1)
+        ).count()
+    }
+    
+    return {
+        "api_usage": stats,
+        "database": db_stats,
+        "ai_status": {
+            "enabled": ai_service.ai_enabled,
+            "embedding_model": ai_service.embedding_model,
+            "chat_model": ai_service.chat_model
+        }
+    }
+
+@app.post("/admin/toggle-ai")
+async def toggle_ai(enable: bool = False):
+    """Toggle AI features on/off"""
+    ai_service.ai_enabled = enable
+    return {
+        "ai_enabled": ai_service.ai_enabled,
+        "message": f"AI features {'enabled' if enable else 'disabled'}"
+    }
+
+@app.post("/admin/process-batch")
+async def trigger_batch_processing():
+    """Manually trigger batch processing"""
+    asyncio.create_task(batch_processor.process_batch())
+    return {"message": "Batch processing started"}
+
+@app.get("/articles/{article_id}/status")
+async def get_article_processing_status(article_id: int):
+    """Check processing status of a specific article"""
+    article = db.query(Article).filter(Article.id == article_id).first()
+    if not article:
+        raise HTTPException(status_code=404, detail="Article not found")
+    
+    return {
+        "id": article.id,
+        "title": article.title,
+        "has_embedding": bool(article.embedding),
+        "has_categories": bool(article.categories),
+        "has_summary": bool(article.summary),
+        "created_at": article.created_at,
+        "processing_complete": bool(article.embedding and article.categories)
+    }
 
 if __name__ == "__main__":
     import uvicorn
