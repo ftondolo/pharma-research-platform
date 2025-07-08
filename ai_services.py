@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 class AIService:
     def __init__(self):
-        self.client = OpenAI(api_key="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")
+        self.client = OpenAI(api_key="")
         self.redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
         
         # Use cheaper models by default
