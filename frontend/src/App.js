@@ -4,35 +4,59 @@ import './App.css';
 // Use empty string to rely on proxy configuration
 const API_BASE = '';
 
+// Utility function to generate stable keys
+const generateKey = (prefix, id, index, fallback = '') => {
+  if (id && id !== 'None' && id !== 'null' && id !== 'undefined') {
+    return `${prefix}-${id}`;
+  }
+  return `${prefix}-${index}-${fallback.substring(0, 20).replace(/\s+/g, '-')}-${Date.now()}`;
+};
+
 // Article Card Component
-const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => {
+const ArticleCard = ({ article, index }) => {
   const [summary, setSummary] = useState(null);
   const [loading, setLoading] = useState(false);
   const [similarArticles, setSimilarArticles] = useState([]);
   const [showSimilar, setShowSimilar] = useState(false);
 
+  // Handle case where article.id might be None or invalid
+  const articleId = article.id && article.id !== 'None' && !article.id.startsWith('temp-') ? article.id : null;
+
   const handleSummarize = async () => {
+    if (!articleId) {
+      alert('Please search again to get proper article IDs before summarizing.');
+      return;
+    }
+
     setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/articles/${article.id}/summarize`, {
+      const response = await fetch(`${API_BASE}/articles/${articleId}/summarize`, {
         method: 'POST'
       });
       if (response.ok) {
         const data = await response.json();
         setSummary(data.summary);
       } else {
-        console.error('Failed to generate summary');
+        const errorText = await response.text();
+        console.error('Failed to generate summary:', errorText);
+        alert('Failed to generate summary. Please try again.');
       }
     } catch (error) {
       console.error('Error generating summary:', error);
+      alert('Error generating summary. Please check your connection.');
     }
     setLoading(false);
   };
 
   const handleFindSimilar = async () => {
+    if (!articleId) {
+      alert('Please search again to get proper article IDs before finding similar articles.');
+      return;
+    }
+
     setLoading(true);
     try {
-      const response = await fetch(`${API_BASE}/articles/${article.id}/similar`);
+      const response = await fetch(`${API_BASE}/articles/${articleId}/similar`);
       if (response.ok) {
         const data = await response.json();
         setSimilarArticles(data.similar_articles || []);
@@ -43,7 +67,8 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
           console.log(`Similar articles found using: ${data.method}`);
         }
       } else {
-        console.error('Failed to find similar articles:', response.status);
+        const errorText = await response.text();
+        console.error('Failed to find similar articles:', response.status, errorText);
         setSimilarArticles([]);
         setShowSimilar(true); // Still show the section with "no results" message
       }
@@ -58,11 +83,12 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
   // Safe access to arrays with fallbacks
   const authors = article.authors || [];
   const categories = article.categories || [];
+  const articleTitle = article.title || 'Untitled';
 
   return (
     <div className="article-card">
       <div className="article-header">
-        <h3>{article.title || 'Untitled'}</h3>
+        <h3>{articleTitle}</h3>
         <span className="journal">{article.journal || 'Unknown Journal'}</span>
       </div>
 
@@ -79,23 +105,36 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
       </div>
 
       <div className="categories">
-        {categories.map((cat, idx) => (
-          <span key={`${article.id}-cat-${idx}-${cat || 'empty'}`} className="category-tag">
-            {cat || 'Uncategorized'}
-          </span>
-        ))}
+        {categories.map((cat, idx) => {
+          const categoryKey = generateKey('cat', articleId, idx, cat || 'uncategorized');
+          return (
+            <span key={categoryKey} className="category-tag">
+              {cat || 'Uncategorized'}
+            </span>
+          );
+        })}
       </div>
 
       <div className="article-actions">
-        <button onClick={handleSummarize} disabled={loading}>
+        <button
+          onClick={handleSummarize}
+          disabled={loading || !articleId}
+          title={!articleId ? 'Search again to enable this feature' : ''}
+        >
           {loading ? 'Generating...' : 'Summarize'}
         </button>
-        <button onClick={handleFindSimilar} disabled={loading}>
+        <button
+          onClick={handleFindSimilar}
+          disabled={loading || !articleId}
+          title={!articleId ? 'Search again to enable this feature' : ''}
+        >
           {loading ? 'Finding...' : 'Find Similar'}
         </button>
-        <a href={article.url} target="_blank" rel="noopener noreferrer">
-          View Full Article
-        </a>
+        {article.url && article.url !== '#' && (
+          <a href={article.url} target="_blank" rel="noopener noreferrer">
+            View Full Article
+          </a>
+        )}
       </div>
 
       {summary && (
@@ -110,11 +149,14 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
               {summary.key_findings && summary.key_findings.length > 0 && (
                 <div><strong>Key Findings:</strong>
                   <ul>
-                    {summary.key_findings.map((finding, idx) => (
-                      <li key={`${article.id}-finding-${idx}-${finding ? finding.substring(0, 10) : 'empty'}`}>
-                        {finding}
-                      </li>
-                    ))}
+                    {summary.key_findings.map((finding, idx) => {
+                      const findingKey = generateKey('finding', articleId, idx, finding || 'empty');
+                      return (
+                        <li key={findingKey}>
+                          {finding}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
               )}
@@ -137,12 +179,10 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
           <h4>Similar Articles</h4>
           {similarArticles.length > 0 ? (
             similarArticles.map((similar, idx) => {
-              // Generate a more stable unique key
-              const titleSnippet = (similar.title || 'untitled').substring(0, 20).replace(/\s+/g, '-');
-              const uniqueKey = `${article.id}-similar-${idx}-${similar.id || titleSnippet}`;
+              const similarKey = generateKey('similar', similar.id, idx, similar.title || 'untitled');
 
               return (
-                <div key={uniqueKey} className="similar-article">
+                <div key={similarKey} className="similar-article">
                   <span className="similarity-score">{(similar.similarity * 100).toFixed(1)}%</span>
                   <div className="similar-details">
                     <div className="similar-title">{similar.title || 'Untitled'}</div>
@@ -248,11 +288,11 @@ const TrendsSection = () => {
       setTrends(null);
     }
     setLoading(false);
-  }, [days]); // Add days as dependency
+  }, [days]);
 
   useEffect(() => {
     fetchTrends();
-  }, [fetchTrends]); // Include fetchTrends in dependency array
+  }, [fetchTrends]);
 
   return (
     <div className="trends-section">
@@ -276,33 +316,42 @@ const TrendsSection = () => {
           <div className="trend-category">
             <h4>Frequent Topics</h4>
             <div className="trend-tags">
-              {(trends.frequent_topics || []).map((topic, idx) => (
-                <span key={`freq-topic-${idx}-${topic || 'empty'}`} className="trend-tag frequent">
-                  {topic || 'Unknown Topic'}
-                </span>
-              ))}
+              {(trends.frequent_topics || []).map((topic, idx) => {
+                const topicKey = generateKey('freq-topic', null, idx, topic || 'empty');
+                return (
+                  <span key={topicKey} className="trend-tag frequent">
+                    {topic || 'Unknown Topic'}
+                  </span>
+                );
+              })}
             </div>
           </div>
 
           <div className="trend-category">
             <h4>Emerging Themes</h4>
             <div className="trend-tags">
-              {(trends.emerging_themes || []).map((theme, idx) => (
-                <span key={`emerg-theme-${idx}-${theme || 'empty'}`} className="trend-tag emerging">
-                  {theme || 'Unknown Theme'}
-                </span>
-              ))}
+              {(trends.emerging_themes || []).map((theme, idx) => {
+                const themeKey = generateKey('emerg-theme', null, idx, theme || 'empty');
+                return (
+                  <span key={themeKey} className="trend-tag emerging">
+                    {theme || 'Unknown Theme'}
+                  </span>
+                );
+              })}
             </div>
           </div>
 
           <div className="trend-category">
             <h4>Notable Shifts</h4>
             <div className="trend-tags">
-              {(trends.notable_shifts || []).map((shift, idx) => (
-                <span key={`shift-${idx}-${shift || 'empty'}`} className="trend-tag shift">
-                  {shift || 'Unknown Shift'}
-                </span>
-              ))}
+              {(trends.notable_shifts || []).map((shift, idx) => {
+                const shiftKey = generateKey('shift', null, idx, shift || 'empty');
+                return (
+                  <span key={shiftKey} className="trend-tag shift">
+                    {shift || 'Unknown Shift'}
+                  </span>
+                );
+              })}
             </div>
           </div>
         </div>
@@ -412,21 +461,23 @@ const App = () => {
                           • Requested {searchMetadata.requested_count} but could only find {searchMetadata.delivered_count} with abstracts
                         </span>
                       )}
+                      {searchMetadata.fetch_attempts > 1 && (
+                        <span className="filter-info">
+                          • Made {searchMetadata.fetch_attempts} API attempts to find articles with abstracts
+                        </span>
+                      )}
                     </div>
                   )}
                 </div>
                 {articles.map((article, index) => {
                   // Generate a stable and unique key
-                  const titleSnippet = (article.title || 'untitled').substring(0, 30).replace(/\s+/g, '-');
-                  const uniqueKey = article.id ||
-                    article.doi ||
-                    `article-${index}-${titleSnippet}-${Date.now()}` ||
-                    `fallback-${index}-${Date.now()}`;
+                  const uniqueKey = generateKey('article', article.id, index, article.title || 'untitled');
 
                   return (
                     <ArticleCard
                       key={uniqueKey}
                       article={article}
+                      index={index}
                     />
                   );
                 })}

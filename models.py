@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field, field_serializer
-from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field, field_validator, field_serializer
+from typing import List, Optional, Dict, Any, Union
 from datetime import datetime, date
 from sqlalchemy import Column, Integer, String, Text, JSON, DateTime, Float
 from sqlalchemy.ext.declarative import declarative_base
@@ -16,7 +16,7 @@ class Article(Base):
     title = Column(Text, nullable=False)
     abstract = Column(Text, nullable=True)
     authors = Column(JSON, nullable=True)
-    publication_date = Column(String, nullable=True)
+    publication_date = Column(String, nullable=True)  # Store as string in DB
     journal = Column(String, nullable=True)
     url = Column(String, nullable=True)
     categories = Column(JSON, nullable=True)
@@ -39,23 +39,32 @@ class ArticleCreate(BaseModel):
 
 APIArticle = ArticleCreate
 
-def safe_parse_date(value: Optional[str]) -> Optional[str]:
+def safe_parse_date(value) -> Optional[str]:
     """
-    Converts strings like '2025' or '2025-07' to full ISO date strings ('2025-01-01').
-    Returns None if parsing fails.
+    Converts various date formats to string.
+    Handles: strings, datetime.date, datetime.datetime, integers (years)
     """
-    if not value:
+    if value is None:
         return None
-    if isinstance(value, date):
-        return value.isoformat()
+    
+    # If it's already a string, return it
     if isinstance(value, str):
-        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y"):
-            try:
-                parsed = datetime.strptime(value, fmt).date()
-                return parsed.isoformat()
-            except ValueError:
-                continue
-    return None
+        return value.strip() if value.strip() else None
+    
+    # If it's a date or datetime object
+    if isinstance(value, (date, datetime)):
+        return str(value.year)  # Just return the year as string
+    
+    # If it's an integer (year)
+    if isinstance(value, int):
+        if 1900 <= value <= 2100:  # Reasonable year range
+            return str(value)
+    
+    # Try to convert to string as fallback
+    try:
+        return str(value)
+    except:
+        return None
 
 class ArticleResponse(BaseModel):
     id: str
@@ -63,7 +72,7 @@ class ArticleResponse(BaseModel):
     title: str
     abstract: Optional[str] = None
     authors: Optional[List[str]] = None
-    publication_date: Optional[str] = None  # Changed to str
+    publication_date: Optional[str] = None
     journal: Optional[str] = None
     url: Optional[str] = None
     categories: Optional[List[str]] = None
@@ -73,8 +82,15 @@ class ArticleResponse(BaseModel):
     class Config:
         from_attributes = True
 
+    @field_validator('publication_date', mode='before')
+    @classmethod
+    def validate_publication_date(cls, v):
+        """Convert any date format to string before validation"""
+        return safe_parse_date(v)
+
     @field_serializer('publication_date')
     def serialize_publication_date(self, pub_date, _info):
+        """Ensure publication date is always serialized as string"""
         return safe_parse_date(pub_date)
 
 class SearchResponse(BaseModel):
