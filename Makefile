@@ -131,6 +131,19 @@ backend:
 # Frontend only
 frontend:
 	@echo "Starting frontend..."
+	@if [ ! -d "frontend" ]; then \
+		echo "Error: frontend directory not found"; \
+		exit 1; \
+	fi
+	@if [ ! -f "frontend/package.json" ]; then \
+		echo "Error: frontend/package.json not found"; \
+		exit 1; \
+	fi
+	@if [ ! -d "frontend/node_modules" ]; then \
+		echo "Installing frontend dependencies..."; \
+		cd frontend && npm install; \
+	fi
+	@echo "Starting React development server..."
 	@cd frontend && npm start
 
 # Database services only

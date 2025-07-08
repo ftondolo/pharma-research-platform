@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import './App.css';
 
-const API_BASE = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+// Use empty string to rely on proxy configuration
+const API_BASE = '';
 
 // Article Card Component
 const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => {
@@ -16,8 +17,12 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
       const response = await fetch(`${API_BASE}/articles/${article.id}/summarize`, {
         method: 'POST'
       });
-      const data = await response.json();
-      setSummary(data.summary);
+      if (response.ok) {
+        const data = await response.json();
+        setSummary(data.summary);
+      } else {
+        console.error('Failed to generate summary');
+      }
     } catch (error) {
       console.error('Error generating summary:', error);
     }
@@ -28,12 +33,24 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
     setLoading(true);
     try {
       const response = await fetch(`${API_BASE}/articles/${article.id}/similar`);
-      const data = await response.json();
-      setSimilarArticles(data.similar_articles || []);
-      setShowSimilar(true);
+      if (response.ok) {
+        const data = await response.json();
+        setSimilarArticles(data.similar_articles || []);
+        setShowSimilar(true);
+
+        // Log method used for debugging
+        if (data.method) {
+          console.log(`Similar articles found using: ${data.method}`);
+        }
+      } else {
+        console.error('Failed to find similar articles:', response.status);
+        setSimilarArticles([]);
+        setShowSimilar(true); // Still show the section with "no results" message
+      }
     } catch (error) {
       console.error('Error finding similar articles:', error);
       setSimilarArticles([]);
+      setShowSimilar(true); // Still show the section with error message
     }
     setLoading(false);
   };
@@ -63,7 +80,9 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
 
       <div className="categories">
         {categories.map((cat, idx) => (
-          <span key={idx} className="category-tag">{cat}</span>
+          <span key={`${article.id}-cat-${idx}-${cat || 'empty'}`} className="category-tag">
+            {cat || 'Uncategorized'}
+          </span>
         ))}
       </div>
 
@@ -82,31 +101,70 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
       {summary && (
         <div className="summary-section">
           <h4>AI Summary</h4>
-          <p><strong>Overview:</strong> {summary.one_line || 'Summary not available'}</p>
-          <div><strong>Key Findings:</strong>
-            <ul>
-              {(summary.key_findings || []).map((finding, idx) => (
-                <li key={idx}>{finding}</li>
-              ))}
-            </ul>
-          </div>
-          <p><strong>Clinical Implications:</strong> {summary.clinical_implications || 'Not available'}</p>
-          {summary.limitations && (
-            <p><strong>Limitations:</strong> {summary.limitations}</p>
+          {typeof summary === 'object' ? (
+            <>
+              <p><strong>Overview:</strong> {summary.one_line || summary.overview || 'Summary not available'}</p>
+              {summary.overview && summary.overview !== summary.one_line && (
+                <p><strong>Details:</strong> {summary.overview}</p>
+              )}
+              {summary.key_findings && summary.key_findings.length > 0 && (
+                <div><strong>Key Findings:</strong>
+                  <ul>
+                    {summary.key_findings.map((finding, idx) => (
+                      <li key={`${article.id}-finding-${idx}-${finding ? finding.substring(0, 10) : 'empty'}`}>
+                        {finding}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+              {summary.clinical_implications && (
+                <p><strong>Clinical Implications:</strong> {summary.clinical_implications}</p>
+              )}
+              {summary.limitations && (
+                <p><strong>Limitations:</strong> {summary.limitations}</p>
+              )}
+              <p><em>Source: {summary.source || 'Generated summary'}</em></p>
+            </>
+          ) : (
+            <p><strong>Summary:</strong> {summary}</p>
           )}
         </div>
       )}
 
-      {showSimilar && similarArticles.length > 0 && (
+      {showSimilar && (
         <div className="similar-section">
           <h4>Similar Articles</h4>
-          {similarArticles.map((similar, idx) => (
-            <div key={idx} className="similar-article">
-              <span className="similarity-score">{(similar.similarity * 100).toFixed(1)}%</span>
-              <span className="similar-title">{similar.title || 'Untitled'}</span>
-              <span className="similar-journal">{similar.journal || 'Unknown'}</span>
+          {similarArticles.length > 0 ? (
+            similarArticles.map((similar, idx) => {
+              // Generate a more stable unique key
+              const titleSnippet = (similar.title || 'untitled').substring(0, 20).replace(/\s+/g, '-');
+              const uniqueKey = `${article.id}-similar-${idx}-${similar.id || titleSnippet}`;
+
+              return (
+                <div key={uniqueKey} className="similar-article">
+                  <span className="similarity-score">{(similar.similarity * 100).toFixed(1)}%</span>
+                  <div className="similar-details">
+                    <div className="similar-title">{similar.title || 'Untitled'}</div>
+                    <div className="similar-journal">{similar.journal || 'Unknown'}</div>
+                    {similar.authors && similar.authors.length > 0 && (
+                      <div className="similar-authors">by {similar.authors.join(', ')}</div>
+                    )}
+                  </div>
+                  {similar.url && similar.url !== '#' && (
+                    <a href={similar.url} target="_blank" rel="noopener noreferrer" className="similar-link">
+                      View
+                    </a>
+                  )}
+                </div>
+              );
+            })
+          ) : (
+            <div className="no-similar">
+              <p>No similar articles found.</p>
+              <p><em>Try searching for related topics or check back later.</em></p>
             </div>
-          ))}
+          )}
         </div>
       )}
     </div>
@@ -117,11 +175,12 @@ const ArticleCard = ({ article, onViewDetails, onSummarize, onFindSimilar }) => 
 const SearchBar = ({ onSearch, loading }) => {
   const [query, setQuery] = useState('');
   const [limit, setLimit] = useState(10);
+  const [requireAbstract, setRequireAbstract] = useState(false);
 
   const handleSubmit = (e) => {
     e.preventDefault();
     if (query.trim()) {
-      onSearch(query, limit);
+      onSearch(query, limit, requireAbstract);
     }
   };
 
@@ -151,6 +210,17 @@ const SearchBar = ({ onSearch, loading }) => {
           {loading ? 'Searching...' : 'Search'}
         </button>
       </div>
+      <div className="search-options">
+        <label className="debug-option">
+          <input
+            type="checkbox"
+            checked={requireAbstract}
+            onChange={(e) => setRequireAbstract(e.target.checked)}
+            disabled={loading}
+          />
+          <span className="debug-label">Debug: Only show articles with abstracts</span>
+        </label>
+      </div>
     </form>
   );
 };
@@ -161,32 +231,28 @@ const TrendsSection = () => {
   const [loading, setLoading] = useState(false);
   const [days, setDays] = useState(30);
 
-  const fetchTrends = async () => {
+  const fetchTrends = useCallback(async () => {
     setLoading(true);
     try {
       const response = await fetch(`${API_BASE}/trends?days=${days}`);
-      const data = await response.json();
-      setTrends(data.trends);
+
+      if (response.ok) {
+        const data = await response.json();
+        setTrends(data.trends || data);
+      } else {
+        console.error('Failed to fetch trends:', response.status);
+        setTrends(null);
+      }
     } catch (error) {
       console.error('Error fetching trends:', error);
       setTrends(null);
     }
     setLoading(false);
-  };
+  }, [days]); // Add days as dependency
 
   useEffect(() => {
-    const fetchTrends = async () => {
-      try {
-        const response = await fetch('/api/trends?days=30');
-        const data = await response.json();
-        setTrends(data);
-      } catch (error) {
-        console.error('Error fetching trends:', error);
-      }
-    };
-
     fetchTrends();
-  }, []);
+  }, [fetchTrends]); // Include fetchTrends in dependency array
 
   return (
     <div className="trends-section">
@@ -211,7 +277,9 @@ const TrendsSection = () => {
             <h4>Frequent Topics</h4>
             <div className="trend-tags">
               {(trends.frequent_topics || []).map((topic, idx) => (
-                <span key={idx} className="trend-tag frequent">{topic}</span>
+                <span key={`freq-topic-${idx}-${topic || 'empty'}`} className="trend-tag frequent">
+                  {topic || 'Unknown Topic'}
+                </span>
               ))}
             </div>
           </div>
@@ -220,7 +288,9 @@ const TrendsSection = () => {
             <h4>Emerging Themes</h4>
             <div className="trend-tags">
               {(trends.emerging_themes || []).map((theme, idx) => (
-                <span key={idx} className="trend-tag emerging">{theme}</span>
+                <span key={`emerg-theme-${idx}-${theme || 'empty'}`} className="trend-tag emerging">
+                  {theme || 'Unknown Theme'}
+                </span>
               ))}
             </div>
           </div>
@@ -229,13 +299,15 @@ const TrendsSection = () => {
             <h4>Notable Shifts</h4>
             <div className="trend-tags">
               {(trends.notable_shifts || []).map((shift, idx) => (
-                <span key={idx} className="trend-tag shift">{shift}</span>
+                <span key={`shift-${idx}-${shift || 'empty'}`} className="trend-tag shift">
+                  {shift || 'Unknown Shift'}
+                </span>
               ))}
             </div>
           </div>
         </div>
       ) : (
-        <div className="no-trends">No trends data available</div>
+        <div className="no-trends">No trends data available. Try searching for articles first.</div>
       )}
     </div>
   );
@@ -247,13 +319,21 @@ const App = () => {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
   const [searchPerformed, setSearchPerformed] = useState(false);
+  const [searchMetadata, setSearchMetadata] = useState(null);
 
-  const handleSearch = async (query, limit) => {
+  const handleSearch = async (query, limit, requireAbstract = false) => {
     setLoading(true);
     setError(null);
+    setSearchMetadata(null);
 
     try {
-      const response = await fetch(`${API_BASE}/search`, {
+      // Build URL with query parameters
+      const searchUrl = new URL(`${API_BASE}/search`, window.location.origin);
+      if (requireAbstract) {
+        searchUrl.searchParams.append('require_abstract', 'true');
+      }
+
+      const response = await fetch(searchUrl, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -272,6 +352,12 @@ const App = () => {
       if (data && data.articles) {
         setArticles(data.articles);
         setSearchPerformed(true);
+        setSearchMetadata(data.metadata || null);
+
+        // Log debug info if abstract filtering was used
+        if (requireAbstract && data.metadata) {
+          console.log(`Search with abstract filter: ${data.articles.length} results, ${data.metadata.filtered_count} filtered out`);
+        }
       } else {
         console.error('Invalid response structure:', data);
         setArticles([]);
@@ -304,18 +390,46 @@ const App = () => {
             {loading && <div className="loading">Searching and processing articles...</div>}
 
             {!loading && searchPerformed && articles.length === 0 && (
-              <div className="no-results">No articles found. Try a different search term.</div>
+              <div className="no-results">No articles found. Try a different search term or disable the abstract filter.</div>
             )}
 
             {!loading && articles.length > 0 && (
               <div className="articles-list">
-                <h2>Search Results ({articles.length})</h2>
-                {articles.map((article, index) => (
-                  <ArticleCard
-                    key={article.id || article.doi || `article-${index}`}
-                    article={article}
-                  />
-                ))}
+                <div className="results-header">
+                  <h2>Search Results</h2>
+                  {searchMetadata && (
+                    <div className="search-stats">
+                      <span className="result-count">
+                        Showing {searchMetadata.delivered_count} of {searchMetadata.total_fetched} articles found
+                      </span>
+                      {searchMetadata.filtered_count > 0 && (
+                        <span className="filter-info">
+                          ({searchMetadata.filtered_count} filtered out for lacking abstracts)
+                        </span>
+                      )}
+                      {!searchMetadata.search_complete && searchMetadata.delivered_count < searchMetadata.requested_count && (
+                        <span className="incomplete-warning">
+                          • Requested {searchMetadata.requested_count} but could only find {searchMetadata.delivered_count} with abstracts
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+                {articles.map((article, index) => {
+                  // Generate a stable and unique key
+                  const titleSnippet = (article.title || 'untitled').substring(0, 30).replace(/\s+/g, '-');
+                  const uniqueKey = article.id ||
+                    article.doi ||
+                    `article-${index}-${titleSnippet}-${Date.now()}` ||
+                    `fallback-${index}-${Date.now()}`;
+
+                  return (
+                    <ArticleCard
+                      key={uniqueKey}
+                      article={article}
+                    />
+                  );
+                })}
               </div>
             )}
           </div>

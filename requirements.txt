@@ -7,9 +7,7 @@ aiohttp==3.11.10
 openai==1.57.0
 python-multipart==0.0.17
 redis==5.2.0
-numpy>=1.26.0
 python-dotenv==1.0.1
 pytest==8.3.4
 pytest-asyncio==0.24.0
 httpx==0.28.1
-tenacity==9.1.2

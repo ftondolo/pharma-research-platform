@@ -7,13 +7,12 @@ import logging
 from typing import Optional, List, Dict
 from openai import OpenAI, OpenAIError
 import redis
-from tenacity import retry, stop_after_attempt, wait_exponential
 
 logger = logging.getLogger(__name__)
 
 class AIService:
     def __init__(self):
-        self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.client = OpenAI(api_key="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")
         self.redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379"))
         
         # Use cheaper models by default
@@ -156,7 +155,7 @@ Return JSON:
             return f"{article.title}. {article.abstract[:200]}..."
         
         try:
-            prompt = f"""Summarize this research article in 2-3 sentences:
+            prompt = f"""Summarize this research article in less than 4 sentences for someone who is already medically knwoledgeable:
 Title: {article.title}
 Abstract: {article.abstract[:1500]}"""
             

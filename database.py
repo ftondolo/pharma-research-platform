@@ -1,8 +1,16 @@
+# backend/database.py
+
+import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import QueuePool
-import os
+from sqlalchemy.exc import SQLAlchemyError
+import logging
+from sqlalchemy import text
+
+# Import the Base and Article from models
 from models import Base
+
+logger = logging.getLogger(__name__)
 
 # Database configuration
 DATABASE_URL = os.getenv(
@@ -10,49 +18,67 @@ DATABASE_URL = os.getenv(
     "postgresql://federicotondolo:melinta@localhost:5432/pharma_research"
 )
 
-# Create engine with proper PostgreSQL configuration
-if DATABASE_URL.startswith("sqlite"):
-    # SQLite configuration
-    engine = create_engine(
-        DATABASE_URL,
-        echo=False,
-        connect_args={"check_same_thread": False}
-    )
-else:
-    # PostgreSQL configuration
-    engine = create_engine(
-        DATABASE_URL,
-        poolclass=QueuePool,
-        pool_size=10,
-        max_overflow=20,
-        pool_pre_ping=True,
-        echo=False  # Set to True for SQL debugging
-    )
+# Create engine with connection pooling
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=10,
+    max_overflow=20,
+    pool_pre_ping=True,
+    pool_recycle=300,
+    echo=False  # Set to True for SQL debugging
+)
 
 # Create session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 def get_db():
-    """Database dependency for FastAPI"""
+    """Dependency to get database session"""
     db = SessionLocal()
     try:
         yield db
+    except SQLAlchemyError as e:
+        logger.error(f"Database error: {e}")
+        db.rollback()
+        raise
     finally:
         db.close()
 
 def init_db():
     """Initialize database tables"""
     try:
+        # Import all models to ensure they're registered
+        from models import Article
+        
+        # Create all tables
         Base.metadata.create_all(bind=engine)
-        print("Database initialized successfully")
+        logger.info("Database tables created successfully")
+        
+        # Test connection
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 1"))
+            logger.info("Database connection successful")
+            
     except Exception as e:
-        print(f"Database initialization failed: {e}")
+        logger.error(f"Database initialization failed: {e}")
         raise
 
-# For testing with SQLite (optional)
-def create_test_db():
-    """Create in-memory SQLite database for testing"""
-    from sqlalchemy import create_engine
-    test_engine = create_engine("sqlite:///test.db", echo=True)
-    Base.metadata.create_all(bind=test_engine)
-    return test_engine
+def test_db_connection():
+    """Test database connection"""
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT 1")).fetchone()
+            logger.info("Database connection test passed")
+            return True
+    except Exception as e:
+        logger.error(f"Database connection test failed: {e}")
+        return False
+
+# Health check function
+def get_db_health():
+    """Get database health status"""
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+            return {"status": "healthy", "database": "connected"}
+    except Exception as e:
+        return {"status": "unhealthy", "error": str(e)}

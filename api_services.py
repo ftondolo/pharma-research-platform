@@ -1,12 +1,28 @@
+# backend/api_services.py
+
 import aiohttp
 import asyncio
-from typing import List, Dict, Any, Optional
-from datetime import datetime, date
-from models import APIArticle
 import xml.etree.ElementTree as ET
-import json
-import os
+from typing import List, Dict, Optional
+import logging
 from urllib.parse import quote
+import json
+from datetime import datetime
+
+# Import the models we need
+from models import ArticleCreate
+
+logger = logging.getLogger(__name__)
+
+def ensure_string_date(date_value):
+    """Ensure date value is a string, not a date object"""
+    if date_value is None:
+        return None
+    if isinstance(date_value, str):
+        return date_value
+    if hasattr(date_value, 'year'):  # datetime.date or datetime.datetime
+        return str(date_value.year)
+    return str(date_value)
 
 class RateLimiter:
     """Simple rate limiter for API calls"""
@@ -28,45 +44,53 @@ class PubMedAPI:
         self.base_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
         self.rate_limiter = RateLimiter(3.0)  # 3 requests per second
         
-    async def search(self, query: str, limit: int = 10) -> List[APIArticle]:
+    async def search(self, query: str, limit: int = 10) -> List[ArticleCreate]:
         """Search PubMed for articles"""
         await self.rate_limiter.wait()
         
         async with aiohttp.ClientSession() as session:
-            # First, search for PMIDs
-            search_url = f"{self.base_url}/esearch.fcgi"
-            search_params = {
-                'db': 'pubmed',
-                'term': query,
-                'retmax': limit,
-                'retmode': 'xml'
-            }
-            
-            async with session.get(search_url, params=search_params) as response:
-                if response.status != 200:
-                    return []
-                
-                search_xml = await response.text()
-                pmids = self._parse_search_results(search_xml)
-                
-                if not pmids:
-                    return []
-                
-                # Get detailed info for each PMID
-                await self.rate_limiter.wait()
-                fetch_url = f"{self.base_url}/efetch.fcgi"
-                fetch_params = {
+            try:
+                # First, search for PMIDs
+                search_url = f"{self.base_url}/esearch.fcgi"
+                search_params = {
                     'db': 'pubmed',
-                    'id': ','.join(pmids),
+                    'term': query,
+                    'retmax': limit,
                     'retmode': 'xml'
                 }
                 
-                async with session.get(fetch_url, params=fetch_params) as fetch_response:
-                    if fetch_response.status != 200:
+                async with session.get(search_url, params=search_params) as response:
+                    if response.status != 200:
+                        logger.error(f"PubMed search failed with status {response.status}")
                         return []
                     
-                    fetch_xml = await fetch_response.text()
-                    return self._parse_articles(fetch_xml)
+                    search_xml = await response.text()
+                    pmids = self._parse_search_results(search_xml)
+                    
+                    if not pmids:
+                        logger.info("No PMIDs found from PubMed search")
+                        return []
+                    
+                    # Get detailed info for each PMID
+                    await self.rate_limiter.wait()
+                    fetch_url = f"{self.base_url}/efetch.fcgi"
+                    fetch_params = {
+                        'db': 'pubmed',
+                        'id': ','.join(pmids),
+                        'retmode': 'xml'
+                    }
+                    
+                    async with session.get(fetch_url, params=fetch_params) as fetch_response:
+                        if fetch_response.status != 200:
+                            logger.error(f"PubMed fetch failed with status {fetch_response.status}")
+                            return []
+                        
+                        fetch_xml = await fetch_response.text()
+                        return self._parse_articles(fetch_xml)
+            
+            except Exception as e:
+                logger.error(f"PubMed API error: {e}")
+                return []
     
     def _parse_search_results(self, xml_content: str) -> List[str]:
         """Parse PMIDs from search results"""
@@ -74,24 +98,34 @@ class PubMedAPI:
             root = ET.fromstring(xml_content)
             pmids = []
             for id_elem in root.findall('.//Id'):
-                pmids.append(id_elem.text)
+                if id_elem.text:
+                    pmids.append(id_elem.text)
             return pmids
-        except:
+        except Exception as e:
+            logger.error(f"Error parsing PubMed search results: {e}")
             return []
     
-    def _parse_articles(self, xml_content: str) -> List[APIArticle]:
+    def _parse_articles(self, xml_content: str) -> List[ArticleCreate]:
         """Parse article details from XML"""
+        articles = []
         try:
             root = ET.fromstring(xml_content)
-            articles = []
             
             for article_elem in root.findall('.//PubmedArticle'):
                 try:
                     medline = article_elem.find('MedlineCitation')
-                    pmid = medline.find('PMID').text
+                    if medline is None:
+                        continue
+                        
+                    pmid_elem = medline.find('PMID')
+                    pmid = pmid_elem.text if pmid_elem is not None else None
                     
                     article_data = medline.find('Article')
-                    title = article_data.find('ArticleTitle').text or ""
+                    if article_data is None:
+                        continue
+                    
+                    title_elem = article_data.find('ArticleTitle')
+                    title = title_elem.text if title_elem is not None else "No title"
                     
                     # Parse authors
                     authors = []
@@ -105,79 +139,85 @@ class PubMedAPI:
                     
                     # Parse journal
                     journal_elem = article_data.find('Journal/Title')
-                    journal = journal_elem.text if journal_elem is not None else ""
+                    journal = journal_elem.text if journal_elem is not None else None
                     
                     # Parse abstract
-                    abstract = ""
+                    abstract = None
                     abstract_elem = article_data.find('Abstract/AbstractText')
                     if abstract_elem is not None:
-                        abstract = abstract_elem.text or ""
+                        abstract = abstract_elem.text
                     
-                    # Parse publication date
+                    # Parse publication date - ensure it's always a string
                     pub_date = None
                     pub_date_elem = article_data.find('Journal/JournalIssue/PubDate')
                     if pub_date_elem is not None:
                         year_elem = pub_date_elem.find('Year')
-                        if year_elem is not None:
-                            try:
-                                pub_date = date(int(year_elem.text), 1, 1)
-                            except:
-                                pass
+                        if year_elem is not None and year_elem.text:
+                            pub_date = str(year_elem.text)  # Ensure string format
                     
                     # Parse DOI
                     doi = None
-                    for article_id in article_data.findall('.//ArticleId'):
+                    for article_id in medline.findall('.//ArticleId'):
                         if article_id.get('IdType') == 'doi':
                             doi = article_id.text
                             break
                     
-                    article = APIArticle(
-                        id=pmid,
+                    # Create URL
+                    url = f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" if pmid else None
+                    
+                    article = ArticleCreate(
                         doi=doi,
                         title=title,
                         authors=authors,
-                        publication_date=pub_date,
+                        publication_date=ensure_string_date(pub_date),
                         journal=journal,
                         abstract=abstract,
-                        url=f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/",
-                        source="pubmed"
+                        url=url
                     )
                     articles.append(article)
                     
                 except Exception as e:
-                    continue  # Skip malformed articles
+                    logger.error(f"Error parsing PubMed article: {e}")
+                    continue
             
             return articles
             
         except Exception as e:
+            logger.error(f"Error parsing PubMed XML: {e}")
             return []
 
 class SemanticScholarAPI:
     """Semantic Scholar API client"""
     def __init__(self):
         self.base_url = "https://api.semanticscholar.org/graph/v1"
-        self.rate_limiter = RateLimiter(100.0)  # 100 requests per second
+        self.rate_limiter = RateLimiter(10.0)  # Conservative rate limit
         
-    async def search(self, query: str, limit: int = 10) -> List[APIArticle]:
+    async def search(self, query: str, limit: int = 10) -> List[ArticleCreate]:
         """Search Semantic Scholar for papers"""
         await self.rate_limiter.wait()
         
         async with aiohttp.ClientSession() as session:
-            search_url = f"{self.base_url}/paper/search"
-            params = {
-                'query': query,
-                'limit': limit,
-                'fields': 'paperId,title,authors,year,journal,abstract,url,externalIds'
-            }
-            
-            async with session.get(search_url, params=params) as response:
-                if response.status != 200:
-                    return []
+            try:
+                search_url = f"{self.base_url}/paper/search"
+                params = {
+                    'query': query,
+                    'limit': limit,
+                    'fields': 'paperId,title,authors,year,journal,abstract,url,externalIds'
+                }
                 
-                data = await response.json()
-                return self._parse_papers(data.get('data', []))
+                async with session.get(search_url, params=params) as response:
+                    if response.status != 200:
+                        logger.error(f"Semantic Scholar search failed with status {response.status}")
+                        return []
+                    
+                    data = await response.json()
+                    return self._parse_papers(data.get('data', []))
+            
+            except Exception as e:
+                logger.error(f"Semantic Scholar API error: {e}")
+                return []
     
-    def _parse_papers(self, papers: List[Dict]) -> List[APIArticle]:
+    def _parse_papers(self, papers: List[Dict]) -> List[ArticleCreate]:
         """Parse papers from Semantic Scholar response"""
         articles = []
         
@@ -189,14 +229,11 @@ class SemanticScholarAPI:
                     if author.get('name'):
                         authors.append(author['name'])
                 
-                # Parse publication date
+                # Parse publication date - ensure it's always a string
                 pub_date = None
                 year = paper.get('year')
                 if year:
-                    try:
-                        pub_date = date(int(year), 1, 1)
-                    except:
-                        pass
+                    pub_date = str(year)  # Ensure string format
                 
                 # Parse DOI
                 doi = None
@@ -204,138 +241,191 @@ class SemanticScholarAPI:
                 if external_ids:
                     doi = external_ids.get('DOI')
                 
-                article = APIArticle(
-                    id=paper['paperId'],
+                # Parse journal
+                journal = None
+                journal_info = paper.get('journal')
+                if journal_info and isinstance(journal_info, dict):
+                    journal = journal_info.get('name')
+                
+                article = ArticleCreate(
                     doi=doi,
-                    title=paper.get('title', ''),
+                    title=paper.get('title', 'No title'),
                     authors=authors,
-                    publication_date=pub_date,
-                    journal=paper.get('journal', {}).get('name', ''),
-                    abstract=paper.get('abstract', ''),
-                    url=paper.get('url', ''),
-                    source="semantic_scholar"
+                    publication_date=ensure_string_date(pub_date),
+                    journal=journal,
+                    abstract=paper.get('abstract'),
+                    url=paper.get('url')
                 )
                 articles.append(article)
                 
             except Exception as e:
-                continue  # Skip malformed papers
+                logger.error(f"Error parsing Semantic Scholar paper: {e}")
+                continue
         
         return articles
 
-class CrossRefAPI:
-    """CrossRef API client"""
+class ArxivAPI:
+    """ArXiv API client"""
     def __init__(self):
-        self.base_url = "https://api.crossref.org/works"
-        self.rate_limiter = RateLimiter(50.0)  # Conservative rate limit
+        self.base_url = "http://export.arxiv.org/api/query"
+        self.rate_limiter = RateLimiter(3.0)  # 3 requests per second
         
-    async def search(self, query: str, limit: int = 10) -> List[APIArticle]:
-        """Search CrossRef for works"""
+    async def search(self, query: str, limit: int = 10) -> List[ArticleCreate]:
+        """Search ArXiv for papers"""
         await self.rate_limiter.wait()
         
         async with aiohttp.ClientSession() as session:
-            params = {
-                'query': query,
-                'rows': limit,
-                'select': 'DOI,title,author,published-print,container-title,abstract,URL'
-            }
-            
-            async with session.get(self.base_url, params=params) as response:
-                if response.status != 200:
-                    return []
+            try:
+                params = {
+                    'search_query': f'all:{query}',
+                    'start': 0,
+                    'max_results': limit,
+                    'sortBy': 'relevance',
+                    'sortOrder': 'descending'
+                }
                 
-                data = await response.json()
-                return self._parse_works(data.get('message', {}).get('items', []))
+                async with session.get(self.base_url, params=params) as response:
+                    if response.status != 200:
+                        logger.error(f"ArXiv search failed with status {response.status}")
+                        return []
+                    
+                    xml_content = await response.text()
+                    return self._parse_arxiv_xml(xml_content)
+            
+            except Exception as e:
+                logger.error(f"ArXiv API error: {e}")
+                return []
     
-    def _parse_works(self, works: List[Dict]) -> List[APIArticle]:
-        """Parse works from CrossRef response"""
+    def _parse_arxiv_xml(self, xml_content: str) -> List[ArticleCreate]:
+        """Parse ArXiv XML response"""
         articles = []
         
-        for work in works:
-            try:
-                # Parse authors
-                authors = []
-                for author in work.get('author', []):
-                    given = author.get('given', '')
-                    family = author.get('family', '')
-                    if given and family:
-                        authors.append(f"{given} {family}")
-                
-                # Parse publication date
-                pub_date = None
-                published = work.get('published-print', {}).get('date-parts', [[]])
-                if published and published[0]:
-                    try:
-                        pub_date = date(published[0][0], published[0][1] if len(published[0]) > 1 else 1, 1)
-                    except:
-                        pass
-                
-                # Parse title
-                title = ""
-                if work.get('title'):
-                    title = work['title'][0] if isinstance(work['title'], list) else work['title']
-                
-                # Parse journal
-                journal = ""
-                if work.get('container-title'):
-                    journal = work['container-title'][0] if isinstance(work['container-title'], list) else work['container-title']
-                
-                article = APIArticle(
-                    id=work['DOI'],
-                    doi=work['DOI'],
-                    title=title,
-                    authors=authors,
-                    publication_date=pub_date,
-                    journal=journal,
-                    abstract=work.get('abstract', ''),
-                    url=work.get('URL', ''),
-                    source="crossref"
-                )
-                articles.append(article)
-                
-            except Exception as e:
-                continue  # Skip malformed works
+        try:
+            # Remove namespace for easier parsing
+            xml_content = xml_content.replace('xmlns=', 'xmlnamespace=')
+            root = ET.fromstring(xml_content)
+            
+            for entry in root.findall('entry'):
+                try:
+                    title_elem = entry.find('title')
+                    title = title_elem.text.strip() if title_elem is not None else "No title"
+                    
+                    summary_elem = entry.find('summary')
+                    summary = summary_elem.text.strip() if summary_elem is not None else None
+                    
+                    # Extract authors
+                    authors = []
+                    for author in entry.findall('author'):
+                        name_elem = author.find('name')
+                        if name_elem is not None:
+                            authors.append(name_elem.text)
+                    
+                    # Extract URL
+                    url = None
+                    id_elem = entry.find('id')
+                    if id_elem is not None:
+                        url = id_elem.text
+                    
+                    # Extract publication date - ensure it's always a string
+                    pub_date = ""
+                    published = entry.find('published')
+                    if published is not None and published.text:
+                        pub_date = str(published.text[:4])  # Just the year as string
+                    
+                    article = ArticleCreate(
+                        doi=None,  # ArXiv doesn't use DOIs
+                        title=title,
+                        abstract=summary,
+                        authors=authors,
+                        publication_date=ensure_string_date(pub_date),
+                        journal="arXiv",
+                        url=url
+                    )
+                    articles.append(article)
+                    
+                except Exception as e:
+                    logger.error(f"Error parsing ArXiv entry: {e}")
+                    continue
+        
+        except Exception as e:
+            logger.error(f"Error parsing ArXiv XML: {e}")
         
         return articles
 
 class APIManager:
     """Unified API manager for all external sources"""
     def __init__(self):
+        # Initialize individual API clients
         self.pubmed = PubMedAPI()
         self.semantic_scholar = SemanticScholarAPI()
-        self.crossref = CrossRefAPI()
+        self.arxiv = ArxivAPI()
         
-    async def search_all(self, query: str, limit: int = 10) -> List[APIArticle]:
-        """Search all APIs concurrently"""
-        # Distribute limit across APIs
-        per_api_limit = max(1, limit // 3)
+        # Track enabled APIs
+        self.apis = {
+            "pubmed": {"client": self.pubmed, "enabled": True},
+            "semantic_scholar": {"client": self.semantic_scholar, "enabled": True},
+            "arxiv": {"client": self.arxiv, "enabled": True}
+        }
         
-        tasks = [
-            self.pubmed.search(query, per_api_limit),
-            self.semantic_scholar.search(query, per_api_limit),
-            self.crossref.search(query, per_api_limit)
-        ]
+        logger.info(f"APIManager initialized with {len(self.apis)} APIs")
+    
+    async def search_all(self, query: str, limit: int = 10, offset: int = 0) -> List[ArticleCreate]:
+        """Search all configured APIs"""
+        all_articles = []
         
-        try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        # Calculate how many to get from each source
+        enabled_apis = [name for name, config in self.apis.items() if config.get("enabled", True)]
+        per_source_limit = max(limit // len(enabled_apis), 3) if enabled_apis else limit
+        
+        # Search each enabled API
+        for api_name, api_config in self.apis.items():
+            if not api_config.get("enabled", True):
+                continue
+                
+            try:
+                logger.info(f"Searching {api_name} for '{query}' (limit: {per_source_limit})")
+                
+                api_client = api_config["client"]
+                articles = await api_client.search(query, per_source_limit)
+                
+                all_articles.extend(articles)
+                logger.info(f"Retrieved {len(articles)} articles from {api_name}")
+                
+            except Exception as e:
+                logger.error(f"Error searching {api_name}: {e}")
+                continue
+        
+        # Remove duplicates by DOI and title
+        unique_articles = []
+        seen_dois = set()
+        seen_titles = set()
+        
+        for article in all_articles:
+            # Skip if we've seen this DOI before
+            if article.doi and article.doi in seen_dois:
+                continue
             
-            # Combine results and deduplicate by DOI
-            all_articles = []
-            seen_dois = set()
+            # Skip if we've seen this exact title before
+            title_lower = (article.title or "").lower().strip()
+            if title_lower and title_lower in seen_titles:
+                continue
             
-            for result in results:
-                if isinstance(result, Exception):
-                    continue  # Skip failed API calls
-                    
-                for article in result:
-                    # Deduplicate by DOI if available
-                    if article.doi and article.doi in seen_dois:
-                        continue
-                    if article.doi:
-                        seen_dois.add(article.doi)
-                    
-                    all_articles.append(article)
-            
-            return all_articles[:limit]
-            
-        except Exception as e:
-            return []
+            # Add to unique list
+            unique_articles.append(article)
+            if article.doi:
+                seen_dois.add(article.doi)
+            if title_lower:
+                seen_titles.add(title_lower)
+        
+        # Apply offset and limit
+        if offset > 0:
+            unique_articles = unique_articles[offset:]
+        
+        result = unique_articles[:limit]
+        logger.info(f"Returning {len(result)} unique articles after deduplication and pagination")
+        return result
+    
+    async def close(self):
+        """Close any active sessions"""
+        # Individual API clients handle their own session management
+        pass
