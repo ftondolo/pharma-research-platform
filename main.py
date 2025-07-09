@@ -11,7 +11,7 @@ import logging
 
 from database import get_db, init_db
 from models import Article, ArticleCreate, ArticleResponse, SearchQuery, SearchResponse, safe_parse_date
-from api_services import enhanced_api_manager  
+from api_services import enhanced_api_manager
 from ai_services import ai_service
 from logging_config import setup_logging, APILogger
 
@@ -172,156 +172,330 @@ async def detailed_health_check(db: Session = Depends(get_db)):
 async def search_articles(
     search_query: SearchQuery,
     require_abstract: bool = Query(False, description="Only show articles with substantial abstracts"),
+    search_database: bool = Query(True, description="Include existing database articles in search"),
     db: Session = Depends(get_db),
     background_tasks: BackgroundTasks = None
 ):
     """
-    Enhanced search for articles across multiple specialized sources.
-    Optimized for finding articles with high-quality abstracts.
+    Hybrid search combining database search with external API scraping.
+    Accurately tracks final source counts after all filtering.
     """
     try:
-        logger.info(f"Enhanced search request: {search_query.query} (require_abstract: {require_abstract}, limit: {search_query.limit})")
+        logger.info(f"Hybrid search request: {search_query.query} (require_abstract: {require_abstract}, search_db: {search_database}, limit: {search_query.limit})")
         
-        # Enhanced search strategy - fetch more initially for better filtering
         target_count = search_query.limit
-        max_fetch_attempts = 2  # Reduced since enhanced APIs are more efficient
-        
-        # Enhanced APIs are better at finding abstracts, so less aggressive multiplier needed
-        articles_per_fetch = target_count * 1.5 if require_abstract else target_count
-        max_fetch_limit = min(search_query.limit * 2, 100)
-        
-        stored_articles = []
+        all_articles = []  # Will track source for each article
         filtered_count = 0
-        total_processed = 0
-        fetch_attempt = 0
+        total_api_calls = 0
         
-        # Enhanced search with intelligent API selection
-        while len(stored_articles) < target_count and fetch_attempt < max_fetch_attempts:
-            fetch_attempt += 1
+        # PHASE 1: Search existing database first
+        database_articles = []
+        if search_database:
+            logger.info("Phase 1: Searching existing database...")
+            db_articles = await search_database_articles(db, search_query.query, target_count * 2, require_abstract)  # Get more for better selection
+            database_articles = db_articles
+            logger.info(f"Found {len(database_articles)} relevant articles in database")
             
-            still_needed = target_count - len(stored_articles)
-            fetch_count = min(still_needed * 2, 50) if require_abstract else still_needed
+            # Mark database articles with source
+            for article in database_articles:
+                all_articles.append({
+                    'article': article,
+                    'source': 'database'
+                })
+        
+        # PHASE 2: Supplement with external APIs if needed
+        remaining_needed = target_count - len(all_articles)
+        external_articles_added = 0
+        
+        if remaining_needed > 0:
+            logger.info(f"Phase 2: Fetching {remaining_needed} additional articles from external APIs...")
             
-            logger.info(f"Enhanced fetch attempt {fetch_attempt}: requesting {fetch_count} articles")
+            max_fetch_attempts = 2
+            fetch_attempt = 0
+            total_processed = 0
             
-            # Use enhanced API manager with intelligent source selection
-            articles = await enhanced_api_manager.search_all(search_query.query, fetch_count, offset=total_processed)
+            # Get article identifiers we already have to avoid duplicates
+            existing_dois = set()
+            existing_titles = set()
+            for item in all_articles:
+                article = item['article']
+                if article.doi:
+                    existing_dois.add(article.doi.lower().strip())
+                if article.title:
+                    existing_titles.add(article.title.lower().strip())
             
-            if not articles:
-                logger.info(f"No more articles found on attempt {fetch_attempt}")
-                break
+            while len(all_articles) < target_count and fetch_attempt < max_fetch_attempts:
+                fetch_attempt += 1
                 
-            logger.info(f"Enhanced APIs returned {len(articles)} articles on attempt {fetch_attempt}")
-            
-            # Process articles with enhanced filtering
-            for article_data in articles:
-                total_processed += 1
+                still_needed = target_count - len(all_articles)
+                # Fetch more when abstract filtering to compensate for filtering
+                fetch_multiplier = 3 if require_abstract else 1.5
+                fetch_count = min(int(still_needed * fetch_multiplier), 50)
                 
-                # Enhanced abstract filtering
-                if require_abstract:
-                    if not article_data.abstract or len(article_data.abstract.strip()) < 100:  # Higher standard
-                        filtered_count += 1
-                        logger.debug(f"Filtered out article with insufficient abstract: {article_data.title[:50]}...")
-                        continue
+                logger.info(f"External fetch attempt {fetch_attempt}: requesting {fetch_count} articles")
                 
-                # Enhanced deduplication
-                existing = None
-                if article_data.doi:
-                    existing = db.query(Article).filter(Article.doi == article_data.doi).first()
+                # Use enhanced API manager
+                external_articles = await enhanced_api_manager.search_all(
+                    search_query.query, fetch_count, offset=total_processed
+                )
+                total_api_calls += 1
                 
-                if not existing and article_data.title:
-                    # More sophisticated title matching
-                    title_normalized = article_data.title.strip().lower()
-                    existing = db.query(Article).filter(
-                        text("LOWER(TRIM(title)) = :title")
-                    ).params(title=title_normalized).first()
-                
-                if existing:
-                    # Apply enhanced abstract filter to existing articles
-                    if require_abstract and (not existing.abstract or len(existing.abstract.strip()) < 100):
-                        filtered_count += 1
-                        continue
-                    
-                    if existing not in stored_articles:
-                        stored_articles.append(existing)
-                else:
-                    # Create new article with enhanced date handling
-                    article = Article(
-                        doi=article_data.doi,
-                        title=article_data.title,
-                        abstract=article_data.abstract,
-                        authors=article_data.authors,
-                        publication_date=convert_string_to_date(article_data.publication_date),
-                        journal=article_data.journal,
-                        url=article_data.url,
-                        embedding=None,
-                        categories=None
-                    )
-                    
-                    db.add(article)
-                    db.flush()  # Get ID immediately
-                    stored_articles.append(article)
-                
-                if len(stored_articles) >= target_count:
+                if not external_articles:
+                    logger.info(f"No more external articles found on attempt {fetch_attempt}")
                     break
-            
-            # Enhanced APIs are more efficient, so smaller threshold for continuation
-            if len(articles) < fetch_count // 3:
-                logger.info("Enhanced APIs returned fewer articles than expected, likely exhausted")
-                break
+                
+                logger.info(f"External APIs returned {len(external_articles)} articles")
+                
+                # Process external articles
+                for article_data in external_articles:
+                    total_processed += 1
+                    
+                    # Skip if we've reached our target
+                    if len(all_articles) >= target_count:
+                        break
+                    
+                    # Abstract filtering
+                    if require_abstract:
+                        if not article_data.abstract or len(article_data.abstract.strip()) < 100:
+                            filtered_count += 1
+                            continue
+                    
+                    # Deduplication against existing results
+                    is_duplicate = False
+                    
+                    if article_data.doi:
+                        doi_clean = article_data.doi.lower().strip()
+                        if doi_clean in existing_dois:
+                            is_duplicate = True
+                    
+                    if not is_duplicate and article_data.title:
+                        title_clean = article_data.title.lower().strip()
+                        if title_clean in existing_titles:
+                            is_duplicate = True
+                    
+                    if is_duplicate:
+                        logger.debug(f"Skipping duplicate: {article_data.title[:50]}...")
+                        continue
+                    
+                    # Check if exists in database (for potential enhancement)
+                    existing = None
+                    if article_data.doi:
+                        existing = db.query(Article).filter(Article.doi == article_data.doi).first()
+                    
+                    if not existing and article_data.title:
+                        title_normalized = article_data.title.strip().lower()
+                        existing = db.query(Article).filter(
+                            text("LOWER(TRIM(title)) = :title")
+                        ).params(title=title_normalized).first()
+                    
+                    if existing:
+                        # Use existing article but count as external since it came from external API
+                        if require_abstract and (not existing.abstract or len(existing.abstract.strip()) < 100):
+                            filtered_count += 1
+                            continue
+                        
+                        all_articles.append({
+                            'article': existing,
+                            'source': 'external'  # Count as external since external API found it
+                        })
+                        
+                        # Update deduplication sets
+                        if existing.doi:
+                            existing_dois.add(existing.doi.lower().strip())
+                        if existing.title:
+                            existing_titles.add(existing.title.lower().strip())
+                    else:
+                        # Create new article
+                        article = Article(
+                            doi=article_data.doi,
+                            title=article_data.title,
+                            abstract=article_data.abstract,
+                            authors=article_data.authors,
+                            publication_date=convert_string_to_date(article_data.publication_date),
+                            journal=article_data.journal,
+                            url=article_data.url,
+                            embedding=None,
+                            categories=None
+                        )
+                        
+                        db.add(article)
+                        db.flush()  # Get ID immediately
+                        
+                        all_articles.append({
+                            'article': article,
+                            'source': 'external'
+                        })
+                        external_articles_added += 1
+                        
+                        # Update deduplication sets
+                        if article.doi:
+                            existing_dois.add(article.doi.lower().strip())
+                        if article.title:
+                            existing_titles.add(article.title.lower().strip())
+                
+                # Break if external APIs seem exhausted
+                if len(external_articles) < fetch_count // 3:
+                    logger.info("External APIs returned fewer articles than expected")
+                    break
         
-        # Commit all articles
+        # Commit new articles
         try:
             db.commit()
-            logger.info(f"Stored {len(stored_articles)} articles with enhanced metadata")
-            if filtered_count > 0:
-                logger.info(f"Enhanced filtering removed {filtered_count} articles with insufficient abstracts")
+            logger.info(f"Committed {external_articles_added} new articles to database")
         except Exception as e:
             logger.error(f"Database commit error: {e}")
             db.rollback()
-            for article in stored_articles:
+            for item in all_articles:
+                article = item['article']
                 if hasattr(article, 'id'):
                     db.refresh(article)
         
-        # Final selection with enhanced quality sorting
-        final_articles = stored_articles[:target_count]
+        # Calculate final accurate counts
+        final_articles = all_articles[:target_count]
         
-        # Enhanced response with better metadata
+        # Count sources in final results
+        final_database_count = sum(1 for item in final_articles if item['source'] == 'database')
+        final_external_count = sum(1 for item in final_articles if item['source'] == 'external')
+        
+        logger.info(f"Final results: {final_database_count} database + {final_external_count} external = {len(final_articles)} total")
+        
         return SearchResponse(
             articles=[
                 ArticleResponse(
-                    id=str(article.id) if article.id is not None else f"temp-{idx}",
-                    doi=article.doi,
-                    title=article.title,
-                    abstract=article.abstract[:800] + "..." if article.abstract and len(article.abstract) > 800 else article.abstract or "",  # Longer abstracts
-                    authors=article.authors or [],
-                    publication_date=safe_parse_date(article.publication_date),
-                    journal=article.journal,
-                    url=article.url,
-                    categories=article.categories or [],
-                    created_at=article.created_at
+                    id=str(item['article'].id) if item['article'].id is not None else f"temp-{idx}",
+                    doi=item['article'].doi,
+                    title=item['article'].title,
+                    abstract=item['article'].abstract[:800] + "..." if item['article'].abstract and len(item['article'].abstract) > 800 else item['article'].abstract or "",
+                    authors=item['article'].authors or [],
+                    publication_date=safe_parse_date(item['article'].publication_date),
+                    journal=item['article'].journal,
+                    url=item['article'].url,
+                    categories=item['article'].categories or [],
+                    created_at=item['article'].created_at
                 )
-                for idx, article in enumerate(final_articles)
+                for idx, item in enumerate(final_articles)
             ],
             total=len(final_articles),
             metadata={
                 "requested_count": search_query.limit,
                 "delivered_count": len(final_articles),
-                "total_fetched": total_processed,
+                "database_results": final_database_count,  # Accurate count of final database articles
+                "external_results": final_external_count,  # Accurate count of final external articles
                 "filtered_count": filtered_count,
                 "require_abstract": require_abstract,
-                "search_complete": len(final_articles) >= target_count or fetch_attempt >= max_fetch_attempts,
-                "fetch_attempts": fetch_attempt,
-                "enhanced_apis_used": True,
-                "api_sources": ["PubMed", "Europe PMC", "Semantic Scholar", "ClinicalTrials.gov", "ArXiv"],
-                "abstract_quality_threshold": 100 if require_abstract else 0
+                "search_database": search_database,
+                "hybrid_search": True,
+                "search_complete": len(final_articles) >= target_count or total_api_calls >= 2,
+                "api_calls_made": total_api_calls,
+                "sources": {
+                    "database": final_database_count,
+                    "external_apis": final_external_count
+                },
+                "api_sources": ["Database", "PubMed", "Europe PMC", "Semantic Scholar", "ClinicalTrials.gov", "ArXiv"]
             }
         )
         
     except Exception as e:
-        logger.error(f"Enhanced search error: {str(e)}")
+        logger.error(f"Hybrid search error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
+async def search_database_articles(db: Session, query: str, limit: int, require_abstract: bool = False) -> List[Article]:
+    """
+    Search existing database articles using multiple strategies
+    """
+    try:
+        # Prepare search terms
+        query_lower = query.lower().strip()
+        query_words = [word for word in query_lower.split() if len(word) >= 3]
+        
+        if not query_words:
+            return []
+        
+        # Build base query
+        base_query = db.query(Article)
+        
+        # Apply abstract filter if required
+        if require_abstract:
+            base_query = base_query.filter(
+                Article.abstract != None,
+                Article.abstract != "",
+                text("LENGTH(TRIM(articles.abstract)) >= 100")
+            )
+        
+        # Strategy 1: Title keyword matching (most relevant)
+        title_conditions = []
+        for word in query_words:
+            title_conditions.append(text("LOWER(title) LIKE :word").params(word=f"%{word}%"))
+        
+        if title_conditions:
+            title_query = base_query.filter(
+                *title_conditions
+            ).order_by(Article.created_at.desc()).limit(limit // 2)  # Half from title matches
+            
+            title_results = title_query.all()
+        else:
+            title_results = []
+        
+        # Strategy 2: Abstract keyword matching (supplementary)
+        remaining_limit = limit - len(title_results)
+        if remaining_limit > 0:
+            abstract_conditions = []
+            for word in query_words:
+                abstract_conditions.append(text("LOWER(abstract) LIKE :word").params(word=f"%{word}%"))
+            
+            if abstract_conditions:
+                # Exclude articles already found by title search
+                title_ids = [article.id for article in title_results]
+                abstract_query = base_query.filter(
+                    *abstract_conditions
+                )
+                
+                if title_ids:
+                    abstract_query = abstract_query.filter(~Article.id.in_(title_ids))
+                
+                abstract_query = abstract_query.order_by(Article.created_at.desc()).limit(remaining_limit)
+                abstract_results = abstract_query.all()
+            else:
+                abstract_results = []
+        else:
+            abstract_results = []
+        
+        # Strategy 3: Journal/author matching (if still need more)
+        combined_results = title_results + abstract_results
+        remaining_limit = limit - len(combined_results)
+        
+        if remaining_limit > 0:
+            # Search in journal names
+            existing_ids = [article.id for article in combined_results]
+            
+            journal_conditions = []
+            for word in query_words:
+                journal_conditions.append(text("LOWER(journal) LIKE :word").params(word=f"%{word}%"))
+            
+            if journal_conditions:
+                other_query = base_query.filter(
+                    *journal_conditions
+                )
+                
+                if existing_ids:
+                    other_query = other_query.filter(~Article.id.in_(existing_ids))
+                
+                other_query = other_query.order_by(Article.created_at.desc()).limit(remaining_limit)
+                other_results = other_query.all()
+            else:
+                other_results = []
+            
+            combined_results.extend(other_results)
+        
+        logger.info(f"Database search found: {len(title_results)} title matches, {len(abstract_results)} abstract matches, {len(combined_results) - len(title_results) - len(abstract_results)} other matches")
+        
+        return combined_results[:limit]
+        
+    except Exception as e:
+        logger.error(f"Database search error: {e}")
+        return []
+    
 @app.get("/articles/{article_id}")
 async def get_article(article_id: str, db: Session = Depends(get_db)):
     """Get detailed article information"""
@@ -519,42 +693,77 @@ async def get_similar_articles(
         raise HTTPException(status_code=500, detail=f"Failed to find similar articles: {str(e)}")
 
 @app.get("/trends")
-async def get_trends(days: int = Query(30, ge=1, le=90)):
-    """Enhanced trends endpoint with sample data"""
+async def get_trends(days: int = Query(30, ge=1, le=90), db: Session = Depends(get_db)):
+    """Real trends analysis from database articles"""
     try:
-        # Enhanced sample trends data
-        trends = {
-            "frequent_topics": [
-                "Cancer Immunotherapy", "CRISPR Gene Editing", "mRNA Vaccines", 
-                "Precision Medicine", "CAR-T Cell Therapy", "Alzheimer's Research"
-            ],
-            "emerging_themes": [
-                "AI-Driven Drug Discovery", "Digital Biomarkers", "Liquid Biopsies",
-                "Organoid Models", "RNA Therapeutics", "Personalized Cancer Vaccines"
-            ],
-            "notable_shifts": [
-                "Remote Patient Monitoring", "Decentralized Clinical Trials", 
-                "AI-Powered Diagnostics", "Gene Therapy Advances", "Digital Therapeutics"
-            ]
-        }
+        from trends_analyzer import trends_analyzer
+        
+        # Get real trends from database
+        trends_data = trends_analyzer.analyze_comprehensive_trends(db, days)
         
         return {
-            "trends": trends, 
+            "trends": {
+                "frequent_topics": trends_data.get("frequent_topics", []),
+                "emerging_themes": trends_data.get("emerging_themes", []),
+                "notable_shifts": trends_data.get("notable_shifts", [])
+            },
+            "search_suggestions": trends_data.get("search_suggestions", []),
             "period_days": days,
-            "message": "Enhanced trends analysis - search for articles to see real-time trends",
-            "enhanced": True,
-            "data_sources": ["PubMed", "Europe PMC", "ClinicalTrials.gov", "Semantic Scholar"]
+            "metadata": {
+                "generated_at": trends_data.get("generated_at"),
+                "data_source": trends_data.get("data_source", "database"),
+                "confidence": trends_data.get("confidence", "medium"),
+                "period_stats": trends_data.get("period_stats", {}),
+                "enhanced": True,
+                "real_data": True
+            }
         }
         
     except Exception as e:
-        logger.error(f"Error in enhanced trends endpoint: {str(e)}")
+        logger.error(f"Error in real trends analysis: {str(e)}")
+        # Fallback to basic trends
         return {
             "trends": {
-                "frequent_topics": ["Cancer Research", "Immunotherapy"],
-                "emerging_themes": ["AI in Medicine", "Digital Health"],
-                "notable_shifts": ["Personalized Medicine", "Gene Therapy"]
+                "frequent_topics": ["Cancer Research", "Drug Discovery", "Clinical Trials"],
+                "emerging_themes": ["AI in Medicine", "Digital Health", "Gene Therapy"],
+                "notable_shifts": ["Personalized Medicine", "Remote Trials"]
             },
-            "enhanced": True
+            "search_suggestions": ["Cancer Immunotherapy", "AI Drug Discovery", "Clinical Trials"],
+            "period_days": days,
+            "metadata": {
+                "data_source": "fallback",
+                "confidence": "low",
+                "enhanced": True,
+                "real_data": False
+            }
+        }
+
+@app.get("/trending-searches")
+async def get_trending_searches(db: Session = Depends(get_db)):
+    """Get trending search terms for quick access"""
+    try:
+        from trends_analyzer import trends_analyzer
+        
+        # Get trending terms that make good searches
+        trending_terms = trends_analyzer.get_trending_searches(db, days=7)
+        
+        return {
+            "trending_searches": trending_terms,
+            "generated_at": datetime.now().isoformat(),
+            "period": "last_7_days",
+            "source": "database_analysis"
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting trending searches: {str(e)}")
+        return {
+            "trending_searches": [
+                "Cancer Immunotherapy", "CRISPR Gene Editing", "mRNA Vaccines",
+                "AI Drug Discovery", "Digital Biomarkers", "Precision Medicine"
+            ],
+            "generated_at": datetime.now().isoformat(),
+            "period": "last_7_days", 
+            "source": "fallback"
         }
 
 @app.get("/usage")

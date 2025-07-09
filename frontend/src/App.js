@@ -12,6 +12,80 @@ const generateKey = (prefix, id, index, fallback = '') => {
   return `${prefix}-${index}-${fallback.substring(0, 20).replace(/\s+/g, '-')}-${Date.now()}`;
 };
 
+// Enhanced Search Component with hybrid search options
+const SearchBar = ({ onSearch, loading }) => {
+  const [query, setQuery] = useState('');
+  const [limit, setLimit] = useState(10);
+  const [requireAbstract, setRequireAbstract] = useState(false);
+  const [searchDatabase, setSearchDatabase] = useState(true);
+
+  const handleSubmit = (e) => {
+    e.preventDefault();
+    if (query.trim()) {
+      onSearch(query, limit, requireAbstract, searchDatabase);
+    }
+  };
+
+  return (
+    <form onSubmit={handleSubmit} className="search-form">
+      <div className="search-input-group">
+        <input
+          type="text"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search pharmaceutical research..."
+          className="search-input"
+          disabled={loading}
+        />
+        <select
+          value={limit}
+          onChange={(e) => setLimit(Number(e.target.value))}
+          className="limit-select"
+          disabled={loading}
+        >
+          <option value={5}>5 results</option>
+          <option value={10}>10 results</option>
+          <option value={20}>20 results</option>
+          <option value={50}>50 results</option>
+        </select>
+        <button type="submit" disabled={loading} className="search-button">
+          {loading ? 'Searching...' : 'Search'}
+        </button>
+      </div>
+
+      <div className="search-options">
+        <div className="option-group">
+          <label className="search-option">
+            <input
+              type="checkbox"
+              checked={searchDatabase}
+              onChange={(e) => setSearchDatabase(e.target.checked)}
+              disabled={loading}
+            />
+            <span className="option-label">
+              🔍 Search existing database
+              <small>Include previously found articles</small>
+            </span>
+          </label>
+
+          <label className="search-option">
+            <input
+              type="checkbox"
+              checked={requireAbstract}
+              onChange={(e) => setRequireAbstract(e.target.checked)}
+              disabled={loading}
+            />
+            <span className="option-label">
+              📄 Only articles with abstracts
+              <small>Higher quality, fewer results</small>
+            </span>
+          </label>
+        </div>
+      </div>
+    </form>
+  );
+};
+
 // Article Card Component
 const ArticleCard = ({ article, index }) => {
   const [summary, setSummary] = useState(null);
@@ -101,7 +175,7 @@ const ArticleCard = ({ article, index }) => {
       </div>
 
       <div className="abstract">
-        <p>{(article.abstract || 'No abstract available.').substring(0, 200)}...</p>
+        <p>{(article.abstract || 'No abstract available.').substring(0, 300)}...</p>
       </div>
 
       <div className="categories">
@@ -211,65 +285,12 @@ const ArticleCard = ({ article, index }) => {
   );
 };
 
-// Search Component
-const SearchBar = ({ onSearch, loading }) => {
-  const [query, setQuery] = useState('');
-  const [limit, setLimit] = useState(10);
-  const [requireAbstract, setRequireAbstract] = useState(false);
-
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    if (query.trim()) {
-      onSearch(query, limit, requireAbstract);
-    }
-  };
-
-  return (
-    <form onSubmit={handleSubmit} className="search-form">
-      <div className="search-input-group">
-        <input
-          type="text"
-          value={query}
-          onChange={(e) => setQuery(e.target.value)}
-          placeholder="Search pharmaceutical research..."
-          className="search-input"
-          disabled={loading}
-        />
-        <select
-          value={limit}
-          onChange={(e) => setLimit(Number(e.target.value))}
-          className="limit-select"
-          disabled={loading}
-        >
-          <option value={5}>5 results</option>
-          <option value={10}>10 results</option>
-          <option value={20}>20 results</option>
-          <option value={50}>50 results</option>
-        </select>
-        <button type="submit" disabled={loading} className="search-button">
-          {loading ? 'Searching...' : 'Search'}
-        </button>
-      </div>
-      <div className="search-options">
-        <label className="debug-option">
-          <input
-            type="checkbox"
-            checked={requireAbstract}
-            onChange={(e) => setRequireAbstract(e.target.checked)}
-            disabled={loading}
-          />
-          <span className="debug-label">Debug: Only show articles with abstracts</span>
-        </label>
-      </div>
-    </form>
-  );
-};
-
-// Trends Component
-const TrendsSection = () => {
+// Interactive Trends Component
+const TrendsSection = ({ onTrendClick }) => {
   const [trends, setTrends] = useState(null);
   const [loading, setLoading] = useState(false);
   const [days, setDays] = useState(30);
+  const [searchSuggestions, setSearchSuggestions] = useState([]);
 
   const fetchTrends = useCallback(async () => {
     setLoading(true);
@@ -279,6 +300,12 @@ const TrendsSection = () => {
       if (response.ok) {
         const data = await response.json();
         setTrends(data.trends || data);
+        setSearchSuggestions(data.search_suggestions || []);
+
+        // Log trend analysis info
+        if (data.metadata) {
+          console.log(`Trends analysis: ${data.metadata.data_source}, confidence: ${data.metadata.confidence}`);
+        }
       } else {
         console.error('Failed to fetch trends:', response.status);
         setTrends(null);
@@ -293,6 +320,13 @@ const TrendsSection = () => {
   useEffect(() => {
     fetchTrends();
   }, [fetchTrends]);
+
+  const handleTrendClick = (trendTerm) => {
+    if (onTrendClick) {
+      console.log('Trend clicked:', trendTerm);
+      onTrendClick(trendTerm);
+    }
+  };
 
   return (
     <div className="trends-section">
@@ -310,7 +344,7 @@ const TrendsSection = () => {
       </div>
 
       {loading ? (
-        <div className="loading">Loading trends...</div>
+        <div className="loading">Analyzing trends...</div>
       ) : trends ? (
         <div className="trends-content">
           <div className="trend-category">
@@ -319,9 +353,14 @@ const TrendsSection = () => {
               {(trends.frequent_topics || []).map((topic, idx) => {
                 const topicKey = generateKey('freq-topic', null, idx, topic || 'empty');
                 return (
-                  <span key={topicKey} className="trend-tag frequent">
+                  <button
+                    key={topicKey}
+                    className="trend-tag frequent clickable"
+                    onClick={() => handleTrendClick(topic)}
+                    title={`Search for "${topic}"`}
+                  >
                     {topic || 'Unknown Topic'}
-                  </span>
+                  </button>
                 );
               })}
             </div>
@@ -333,9 +372,14 @@ const TrendsSection = () => {
               {(trends.emerging_themes || []).map((theme, idx) => {
                 const themeKey = generateKey('emerg-theme', null, idx, theme || 'empty');
                 return (
-                  <span key={themeKey} className="trend-tag emerging">
+                  <button
+                    key={themeKey}
+                    className="trend-tag emerging clickable"
+                    onClick={() => handleTrendClick(theme)}
+                    title={`Search for "${theme}"`}
+                  >
                     {theme || 'Unknown Theme'}
-                  </span>
+                  </button>
                 );
               })}
             </div>
@@ -347,16 +391,44 @@ const TrendsSection = () => {
               {(trends.notable_shifts || []).map((shift, idx) => {
                 const shiftKey = generateKey('shift', null, idx, shift || 'empty');
                 return (
-                  <span key={shiftKey} className="trend-tag shift">
+                  <button
+                    key={shiftKey}
+                    className="trend-tag shift clickable"
+                    onClick={() => handleTrendClick(shift)}
+                    title={`Search for "${shift}"`}
+                  >
                     {shift || 'Unknown Shift'}
-                  </span>
+                  </button>
                 );
               })}
             </div>
           </div>
+
+          {searchSuggestions && searchSuggestions.length > 0 && (
+            <div className="trend-category">
+              <h4>Quick Searches</h4>
+              <div className="trend-tags">
+                {searchSuggestions.map((suggestion, idx) => {
+                  const suggestionKey = generateKey('suggestion', null, idx, suggestion || 'empty');
+                  return (
+                    <button
+                      key={suggestionKey}
+                      className="trend-tag suggestion clickable"
+                      onClick={() => handleTrendClick(suggestion)}
+                      title={`Search for "${suggestion}"`}
+                    >
+                      🔍 {suggestion}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
         </div>
       ) : (
-        <div className="no-trends">No trends data available. Try searching for articles first.</div>
+        <div className="no-trends">
+          No trends data available. Search for articles to generate trends.
+        </div>
       )}
     </div>
   );
@@ -370,7 +442,7 @@ const App = () => {
   const [searchPerformed, setSearchPerformed] = useState(false);
   const [searchMetadata, setSearchMetadata] = useState(null);
 
-  const handleSearch = async (query, limit, requireAbstract = false) => {
+  const handleSearch = async (query, limit, requireAbstract = false, searchDatabase = true) => {
     setLoading(true);
     setError(null);
     setSearchMetadata(null);
@@ -380,6 +452,9 @@ const App = () => {
       const searchUrl = new URL(`${API_BASE}/search`, window.location.origin);
       if (requireAbstract) {
         searchUrl.searchParams.append('require_abstract', 'true');
+      }
+      if (!searchDatabase) {
+        searchUrl.searchParams.append('search_database', 'false');
       }
 
       const response = await fetch(searchUrl, {
@@ -396,14 +471,19 @@ const App = () => {
       }
 
       const data = await response.json();
-      console.log('Search response:', data); // Debug log
+      console.log('Hybrid search response:', data);
 
       if (data && data.articles) {
         setArticles(data.articles);
         setSearchPerformed(true);
         setSearchMetadata(data.metadata || null);
 
-        // Log debug info if abstract filtering was used
+        // Log hybrid search info
+        if (data.metadata && data.metadata.hybrid_search) {
+          console.log(`Hybrid search: ${data.metadata.database_results} from database, ${data.metadata.external_results} from external APIs`);
+        }
+
+        // Log abstract filtering info
         if (requireAbstract && data.metadata) {
           console.log(`Search with abstract filter: ${data.articles.length} results, ${data.metadata.filtered_count} filtered out`);
         }
@@ -421,6 +501,20 @@ const App = () => {
     setLoading(false);
   };
 
+  const handleTrendClick = (trendTerm) => {
+    console.log('Searching for trend:', trendTerm);
+    // For trend searches, include both database and external sources with abstracts
+    handleSearch(trendTerm, 15, true, true);
+
+    // Scroll to results
+    setTimeout(() => {
+      const resultsSection = document.querySelector('.articles-section');
+      if (resultsSection) {
+        resultsSection.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }
+    }, 100);
+  };
+
   return (
     <div className="App">
       <header className="app-header">
@@ -436,10 +530,28 @@ const App = () => {
 
         <div className="content-grid">
           <div className="articles-section">
-            {loading && <div className="loading">Searching and processing articles...</div>}
+            {loading && (
+              <div className="loading">
+                <div className="loading-text">Searching articles...</div>
+                <div className="loading-details">
+                  <span>🔍 Checking database</span>
+                  <span>🌐 Fetching from external APIs</span>
+                  <span>📊 Analyzing results</span>
+                </div>
+              </div>
+            )}
 
             {!loading && searchPerformed && articles.length === 0 && (
-              <div className="no-results">No articles found. Try a different search term or disable the abstract filter.</div>
+              <div className="no-results">
+                <h3>No articles found</h3>
+                <p>Try different search terms or adjust your filters:</p>
+                <ul>
+                  <li>Enable database search to include existing articles</li>
+                  <li>Disable abstract requirement for more results</li>
+                  <li>Use broader search terms</li>
+                  <li>Try clicking trend buttons for curated searches</li>
+                </ul>
+              </div>
             )}
 
             {!loading && articles.length > 0 && (
@@ -449,28 +561,56 @@ const App = () => {
                   {searchMetadata && (
                     <div className="search-stats">
                       <span className="result-count">
-                        Showing {searchMetadata.delivered_count} of {searchMetadata.total_fetched} articles found
+                        Showing {searchMetadata.delivered_count} articles
                       </span>
+
+                      {searchMetadata.hybrid_search && (
+                        <div className="hybrid-stats">
+                          <span className="source-breakdown">
+                            📚 {searchMetadata.database_results} from database •
+                            🌐 {searchMetadata.external_results} from external sources
+                          </span>
+                        </div>
+                      )}
+
                       {searchMetadata.filtered_count > 0 && (
                         <span className="filter-info">
                           ({searchMetadata.filtered_count} filtered out for lacking abstracts)
                         </span>
                       )}
+
                       {!searchMetadata.search_complete && searchMetadata.delivered_count < searchMetadata.requested_count && (
                         <span className="incomplete-warning">
                           • Requested {searchMetadata.requested_count} but could only find {searchMetadata.delivered_count} with abstracts
                         </span>
                       )}
+
                       {searchMetadata.fetch_attempts > 1 && (
                         <span className="filter-info">
                           • Made {searchMetadata.fetch_attempts} API attempts to find articles with abstracts
                         </span>
                       )}
+
+                      {searchMetadata.enhanced_apis_used && (
+                        <span className="enhancement-info">
+                          • Enhanced with multi-source APIs and real-time trends
+                        </span>
+                      )}
+
+                      {searchMetadata.sources && (
+                        <span className="sources-info">
+                          Sources: {Object.entries(searchMetadata.sources)
+                            .filter(([key, value]) => value > 0)
+                            .map(([key, value]) => `${key}: ${value}`)
+                            .join(', ')
+                          }
+                        </span>
+                      )}
                     </div>
                   )}
                 </div>
+
                 {articles.map((article, index) => {
-                  // Generate a stable and unique key
                   const uniqueKey = generateKey('article', article.id, index, article.title || 'untitled');
 
                   return (
@@ -486,7 +626,7 @@ const App = () => {
           </div>
 
           <div className="sidebar">
-            <TrendsSection />
+            <TrendsSection onTrendClick={handleTrendClick} />
           </div>
         </div>
       </main>

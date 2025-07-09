@@ -1,0 +1,333 @@
+# trends_analyzer.py - Real keyword trend analysis from database
+
+import re
+import logging
+from typing import Dict, List, Tuple
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from sqlalchemy import text, and_
+
+from models import Article
+
+logger = logging.getLogger(__name__)
+
+class TrendsAnalyzer:
+    """Analyzes real trends from article database"""
+    
+    def __init__(self):
+        # Medical/pharmaceutical keywords to prioritize
+        self.medical_keywords = {
+            'cancer', 'tumor', 'oncology', 'chemotherapy', 'immunotherapy', 
+            'clinical', 'trial', 'drug', 'therapy', 'treatment', 'medicine',
+            'pharmaceutical', 'biomarker', 'diagnosis', 'patient', 'disease',
+            'vaccine', 'antibody', 'protein', 'gene', 'genetic', 'molecular',
+            'crispr', 'rna', 'dna', 'cell', 'stem', 'regenerative', 'precision',
+            'personalized', 'targeted', 'inhibitor', 'receptor', 'pathway',
+            'alzheimer', 'diabetes', 'cardiovascular', 'neurological',
+            'infectious', 'viral', 'bacterial', 'immune', 'inflammation'
+        }
+        
+        # Stop words to exclude
+        self.stop_words = {
+            'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with',
+            'by', 'the', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been',
+            'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could',
+            'should', 'may', 'might', 'can', 'must', 'shall', 'this', 'that',
+            'these', 'those', 'we', 'us', 'our', 'you', 'your', 'they', 'them',
+            'their', 'it', 'its', 'he', 'him', 'his', 'she', 'her', 'hers',
+            'study', 'research', 'analysis', 'investigation', 'article', 'paper',
+            'using', 'used', 'use', 'new', 'novel', 'recent', 'current',
+            'findings', 'results', 'conclusion', 'conclusions', 'abstract',
+            'background', 'methods', 'method', 'methodology', 'approach'
+        }
+    
+    def extract_keywords_from_text(self, text: str) -> List[str]:
+        """Extract meaningful keywords from text"""
+        if not text:
+            return []
+        
+        # Convert to lowercase and extract words
+        text = text.lower()
+        # Remove special characters but keep hyphens in compound words
+        words = re.findall(r'\b[a-z]+(?:-[a-z]+)*\b', text)
+        
+        # Filter keywords
+        keywords = []
+        for word in words:
+            # Skip if too short, stop word, or too common
+            if (len(word) >= 3 and 
+                word not in self.stop_words and
+                not word.isdigit()):
+                keywords.append(word)
+        
+        return keywords
+    
+    def extract_compound_terms(self, text: str) -> List[str]:
+        """Extract compound medical terms"""
+        if not text:
+            return []
+        
+        text = text.lower()
+        compound_patterns = [
+            r'\b(?:immune|immuno)\s*(?:therapy|oncology|suppression|deficiency)\b',
+            r'\b(?:gene|genetic)\s*(?:therapy|editing|expression|mutation)\b',
+            r'\b(?:stem|cancer)\s*(?:cell|cells)\b',
+            r'\b(?:clinical|randomized)\s*(?:trial|trials|study)\b',
+            r'\b(?:targeted|precision|personalized)\s*(?:therapy|medicine|treatment)\b',
+            r'\b(?:machine|artificial)\s*(?:learning|intelligence)\b',
+            r'\b(?:drug|therapeutic)\s*(?:discovery|development|target)\b',
+            r'\bcrispr\s*(?:cas9|cas12|editing)\b',
+            r'\b(?:mrna|rna)\s*(?:vaccine|therapy|therapeutics)\b',
+            r'\b(?:biomarker|diagnostic)\s*(?:discovery|development|validation)\b'
+        ]
+        
+        compounds = []
+        for pattern in compound_patterns:
+            matches = re.findall(pattern, text)
+            compounds.extend([match.replace(' ', '-') for match in matches])
+        
+        return compounds
+    
+    def analyze_temporal_trends(self, db: Session, days: int = 30) -> Dict:
+        """Analyze trends over time periods"""
+        now = datetime.now()
+        current_period = now - timedelta(days=days)
+        previous_period = current_period - timedelta(days=days)
+        
+        # Get articles from both periods
+        current_articles = db.query(Article).filter(
+            Article.created_at >= current_period
+        ).all()
+        
+        previous_articles = db.query(Article).filter(
+            and_(
+                Article.created_at >= previous_period,
+                Article.created_at < current_period
+            )
+        ).all()
+        
+        # Extract keywords from both periods
+        current_keywords = self._extract_article_keywords(current_articles)
+        previous_keywords = self._extract_article_keywords(previous_articles)
+        
+        # Analyze trends
+        trends = {
+            'frequent_topics': self._get_frequent_topics(current_keywords),
+            'emerging_themes': self._get_emerging_themes(current_keywords, previous_keywords),
+            'notable_shifts': self._get_notable_shifts(current_keywords, previous_keywords),
+            'period_stats': {
+                'current_articles': len(current_articles),
+                'previous_articles': len(previous_articles),
+                'total_keywords': len(current_keywords),
+                'analysis_period_days': days
+            }
+        }
+        
+        return trends
+    
+    def _extract_article_keywords(self, articles: List[Article]) -> Counter:
+        """Extract and count keywords from articles"""
+        all_keywords = Counter()
+        
+        for article in articles:
+            # Extract from title (weighted more heavily)
+            title_keywords = self.extract_keywords_from_text(article.title)
+            title_compounds = self.extract_compound_terms(article.title)
+            
+            # Extract from abstract
+            abstract_keywords = self.extract_keywords_from_text(article.abstract)
+            abstract_compounds = self.extract_compound_terms(article.abstract)
+            
+            # Extract from journal (for subject area)
+            journal_keywords = self.extract_keywords_from_text(article.journal)
+            
+            # Weight keywords by source
+            for keyword in title_keywords:
+                all_keywords[keyword] += 3  # Title words weighted more
+            
+            for keyword in title_compounds:
+                all_keywords[keyword] += 5  # Compound terms weighted highest
+                
+            for keyword in abstract_keywords:
+                all_keywords[keyword] += 1
+                
+            for keyword in abstract_compounds:
+                all_keywords[keyword] += 2
+            
+            for keyword in journal_keywords:
+                all_keywords[keyword] += 1
+        
+        return all_keywords
+    
+    def _get_frequent_topics(self, keywords: Counter, limit: int = 8) -> List[str]:
+        """Get most frequent topics with medical prioritization"""
+        # Boost medical keywords
+        boosted_keywords = Counter()
+        for keyword, count in keywords.items():
+            if keyword in self.medical_keywords:
+                boosted_keywords[keyword] = count * 2
+            elif any(med_term in keyword for med_term in self.medical_keywords):
+                boosted_keywords[keyword] = count * 1.5
+            else:
+                boosted_keywords[keyword] = count
+        
+        # Get top keywords
+        top_keywords = [keyword.replace('-', ' ').title() 
+                       for keyword, _ in boosted_keywords.most_common(limit)]
+        
+        return top_keywords
+    
+    def _get_emerging_themes(self, current: Counter, previous: Counter, limit: int = 6) -> List[str]:
+        """Identify emerging themes (growing keywords)"""
+        emerging = []
+        
+        for keyword, current_count in current.most_common(50):  # Check top 50
+            previous_count = previous.get(keyword, 0)
+            
+            # Calculate growth
+            if previous_count == 0 and current_count >= 2:
+                # Completely new terms
+                growth_score = current_count * 10
+            elif previous_count > 0:
+                # Growing terms
+                growth_rate = (current_count - previous_count) / previous_count
+                if growth_rate > 0.5:  # 50% growth
+                    growth_score = current_count * growth_rate
+                else:
+                    continue
+            else:
+                continue
+            
+            # Boost medical terms
+            if keyword in self.medical_keywords or any(med in keyword for med in self.medical_keywords):
+                growth_score *= 1.5
+            
+            emerging.append((keyword, growth_score))
+        
+        # Sort by growth score and return top themes
+        emerging.sort(key=lambda x: x[1], reverse=True)
+        return [keyword.replace('-', ' ').title() for keyword, _ in emerging[:limit]]
+    
+    def _get_notable_shifts(self, current: Counter, previous: Counter, limit: int = 5) -> List[str]:
+        """Identify notable shifts in research focus"""
+        shifts = []
+        
+        # Find keywords that changed significantly in ranking
+        current_top = dict(current.most_common(30))
+        previous_top = dict(previous.most_common(30))
+        
+        # Look for terms that jumped in ranking
+        current_ranks = {keyword: i for i, (keyword, _) in enumerate(current.most_common(50))}
+        previous_ranks = {keyword: i for i, (keyword, _) in enumerate(previous.most_common(50))}
+        
+        for keyword in current_ranks:
+            current_rank = current_ranks[keyword]
+            previous_rank = previous_ranks.get(keyword, 100)  # Assume low rank if not found
+            
+            # Significant rank improvement
+            if previous_rank - current_rank >= 10 and current_rank <= 20:
+                rank_improvement = previous_rank - current_rank
+                
+                # Create descriptive shift
+                if keyword in self.medical_keywords:
+                    shifts.append((f"{keyword.replace('-', ' ').title()}", rank_improvement))
+                elif 'clinical' in keyword:
+                    shifts.append((f"Clinical {keyword.replace('clinical-', '').replace('-', ' ').title()}", rank_improvement))
+                elif 'drug' in keyword:
+                    shifts.append((f"Drug {keyword.replace('drug-', '').replace('-', ' ').title()}", rank_improvement))
+                else:
+                    shifts.append((keyword.replace('-', ' ').title(), rank_improvement))
+        
+        # Sort by rank improvement
+        shifts.sort(key=lambda x: x[1], reverse=True)
+        return [shift[0] for shift in shifts[:limit]]
+    
+    def get_trending_searches(self, db: Session, days: int = 7) -> List[str]:
+        """Get trending search terms that would make good search buttons"""
+        trends = self.analyze_temporal_trends(db, days)
+        
+        # Combine all trends and prioritize by searchability
+        search_terms = []
+        
+        # Add frequent topics (good for broad searches)
+        for topic in trends['frequent_topics'][:4]:
+            search_terms.append(topic)
+        
+        # Add emerging themes (good for cutting-edge searches)
+        for theme in trends['emerging_themes'][:3]:
+            search_terms.append(theme)
+        
+        # Add notable shifts (good for trending searches)
+        for shift in trends['notable_shifts'][:2]:
+            search_terms.append(shift)
+        
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_terms = []
+        for term in search_terms:
+            if term.lower() not in seen:
+                seen.add(term.lower())
+                unique_terms.append(term)
+        
+        return unique_terms
+    
+    def analyze_comprehensive_trends(self, db: Session, days: int = 30) -> Dict:
+        """Comprehensive trend analysis for the trends endpoint"""
+        logger.info(f"Analyzing trends for last {days} days...")
+        
+        try:
+            # Check if we have enough data
+            total_articles = db.query(Article).count()
+            if total_articles < 5:
+                logger.warning("Insufficient data for trend analysis")
+                return self._get_fallback_trends()
+            
+            # Get temporal trends
+            trends = self.analyze_temporal_trends(db, days)
+            
+            # Enhance with search-friendly terms
+            trends['search_suggestions'] = self.get_trending_searches(db, days)
+            
+            # Add metadata
+            trends['generated_at'] = datetime.now().isoformat()
+            trends['data_source'] = 'database_analysis'
+            trends['confidence'] = 'high' if total_articles >= 50 else 'medium' if total_articles >= 20 else 'low'
+            
+            logger.info(f"Generated trends from {total_articles} articles")
+            return trends
+            
+        except Exception as e:
+            logger.error(f"Error analyzing trends: {e}")
+            return self._get_fallback_trends()
+    
+    def _get_fallback_trends(self) -> Dict:
+        """Fallback trends when database analysis fails"""
+        return {
+            "frequent_topics": [
+                "Cancer Immunotherapy", "Drug Discovery", "Clinical Trials", 
+                "Gene Therapy", "Biomarkers", "Precision Medicine"
+            ],
+            "emerging_themes": [
+                "AI Drug Discovery", "Digital Health", "RNA Therapeutics",
+                "Liquid Biopsies", "Organoid Models"
+            ],
+            "notable_shifts": [
+                "Remote Clinical Trials", "Digital Therapeutics", 
+                "Patient-Centric Design"
+            ],
+            "search_suggestions": [
+                "Cancer Immunotherapy", "CRISPR Gene Editing", "mRNA Vaccines",
+                "AI Drug Discovery", "Digital Biomarkers"
+            ],
+            "period_stats": {
+                "current_articles": 0,
+                "analysis_period_days": 30
+            },
+            "generated_at": datetime.now().isoformat(),
+            "data_source": "fallback_data",
+            "confidence": "low"
+        }
+
+# Create singleton instance
+trends_analyzer = TrendsAnalyzer()
